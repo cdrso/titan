@@ -1,0 +1,7 @@
+error: Field type `Mutex < u64 >` contains `Mutex` which is process-local.
+       `std::sync::Mutex` does not work across process boundaries.
+       help: use atomic types (AtomicU64, AtomicBool, etc.) for cross-process synchronization
+ --> tests/ui/mutex_not_allowed.rs:7:11
+  |
+7 |     lock: Mutex<u64>,
+  |           ^^^^^

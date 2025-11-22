@@ -1,7 +1,26 @@
-[package]
-name = "stealth"
+[workspace]
+resolver = "3"
+members = [
+    "titan",
+    "titan-derive",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+authors = ["Alejandro Cadarso Nieto acadarsotp@gmail.com>"]
+license = ""
+repository = ""
 
-[dependencies]
+[workspace.dependencies]
+# Main crate dependencies
 rustix = { version = "1.1.2", features = ["mm", "shm"] }
+
+# Derive crate dependencies
+syn = { version = "2.0.111", features = ["full"] }
+quote = "1.0.42"
+proc-macro2 = "1.0.103"
+proc-macro-crate = "3.4.0"
+
+# Dev dependencies
+trybuild = "1.0.114"

@@ -1,0 +1,7 @@
+error: Field type `RwLock < u64 >` contains `RwLock` which is process-local.
+       `std::sync::RwLock` does not work across process boundaries.
+       help: use atomic types (AtomicU64, AtomicBool, etc.) for cross-process synchronization
+ --> tests/ui/rwlock_not_allowed.rs:7:11
+  |
+7 |     lock: RwLock<u64>,
+  |           ^^^^^^

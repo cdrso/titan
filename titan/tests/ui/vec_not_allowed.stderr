@@ -1,0 +1,7 @@
+error: Field type `Vec < u8 >` contains `Vec` which has heap allocation.
+       Shared memory cannot contain pointer types.
+       help: use inline data like `[T; N]` instead of `Vec<T>`, or primitive types
+ --> tests/ui/vec_not_allowed.rs:6:11
+  |
+6 |     data: Vec<u8>,
+  |           ^^^

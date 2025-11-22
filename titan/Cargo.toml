@@ -1,0 +1,11 @@
+[package]
+name = "titan"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustix.workspace = true
+titan-derive = { path = "../titan-derive" }
+
+[dev-dependencies]
+trybuild.workspace = true

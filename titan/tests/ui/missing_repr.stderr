@@ -1,0 +1,6 @@
+error: SharedMemorySafe requires #[repr(C)] or #[repr(transparent)]
+       help: add #[repr(C)] above this item
+ --> tests/ui/missing_repr.rs:4:1
+  |
+4 | struct MissingRepr {
+  | ^^^^^^

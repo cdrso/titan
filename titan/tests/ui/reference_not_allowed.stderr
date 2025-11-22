@@ -1,0 +1,7 @@
+error: Field type `& 'static u32` contains a reference (`&` or `&mut`).
+       References are process-specific and cannot be shared across processes.
+       help: use inline data or atomics instead
+ --> tests/ui/reference_not_allowed.rs:6:11
+  |
+6 |     data: &'static u32,
+  |           ^

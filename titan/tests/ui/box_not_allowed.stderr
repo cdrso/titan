@@ -1,0 +1,7 @@
+error: Field type `Box < u32 >` contains `Box` which has heap allocation.
+       Shared memory cannot contain pointer types.
+       help: use inline data like `[T; N]` instead of `Vec<T>`, or primitive types
+ --> tests/ui/box_not_allowed.rs:6:11
+  |
+6 |     data: Box<u32>,
+  |           ^^^
