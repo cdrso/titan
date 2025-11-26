@@ -2,12 +2,12 @@
 //!
 //! This module provides a safe, zero-cost abstraction over POSIX shared memory
 //! (`shm_open`, `mmap`) with compile-time guarantees about memory layout and
-//! cleanup behavior using Rust's type system.
+//! cleanup behavior
 //!
 //! # Overview
 //!
-//! - [`Shm<T, Mode>`] - Smart pointer to shared memory with typestate-based cleanup
-//! - [`SharedMemorySafe`] - Trait marking types safe for cross-process sharing
+//! - [`Shm<T, Mode>`] - Smart pointer to shared memory
+//! - [`SharedMemorySafe`] - Trait marking types
 //! - [`Creator`] - Typestate marker: creates new shared memory, unlinks on drop
 //! - [`Opener`] - Typestate marker: opens existing shared memory, no unlink on drop
 //!
@@ -24,14 +24,18 @@
 //!     value: AtomicU64,
 //! }
 //!
-//! impl Default for Counter {
-//!     fn default() -> Self {
-//!         Self { value: AtomicU64::new(0) }
+//! impl Counter {
+//!     unsafe fn init_shared(ptr: *mut Self) {
+//!         unsafe {
+//!             std::ptr::addr_of_mut!((*ptr).value).write(AtomicU64::new(0));
+//!         }
 //!     }
 //! }
 //!
-//! // Process A: Create and initialize
-//! let counter = Shm::<Counter, Creator>::create("/my-counter")?;
+//! // Process A: Create and initialize in-place
+//! let counter = Shm::<Counter, Creator>::create("/my-counter", |ptr| unsafe {
+//!     Counter::init_shared(ptr);
+//! })?;
 //! counter.value.store(42, Ordering::Release);
 //!
 //! // Process B: Open and read
@@ -84,8 +88,8 @@
 //! - No obvious pointer types (Vec, Box, String, &, *, etc.)
 //! - All fields implement `SharedMemorySafe`
 //!
-//! Types used with [`Shm::create()`] must also implement `Default` to provide
-//! the canonical "empty" initial state (e.g., counters at 0, flags false).
+//! Types used with [`Shm::create()`] must provide an initialization function
+//! that writes fields directly into the mmap'd memory.
 //!
 //! See [`SharedMemorySafe`] for detailed requirements.
 //!
@@ -115,7 +119,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::ops::Deref;
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr::{NonNull, null_mut};
 use std::sync::atomic::*;
 
@@ -227,8 +231,14 @@ pub trait ShmMode {
 /// # use std::sync::atomic::AtomicU64;
 /// # #[repr(C)] struct Counter { value: AtomicU64 }
 /// # unsafe impl SharedMemorySafe for Counter {}
-/// # impl Default for Counter { fn default() -> Self { Self { value: AtomicU64::new(0) } } }
-/// let counter = Shm::<Counter, Creator>::create("/counter")?;
+/// # impl Counter {
+/// #     unsafe fn init_shared(ptr: *mut Self) {
+/// #         std::ptr::addr_of_mut!((*ptr).value).write(AtomicU64::new(0));
+/// #     }
+/// # }
+/// let counter = Shm::<Counter, Creator>::create("/counter", |ptr| unsafe {
+///     Counter::init_shared(ptr);
+/// })?;
 /// // ... use counter ...
 /// // On drop: unmaps AND unlinks "/counter"
 /// # Ok::<(), ShmError>(())
@@ -300,7 +310,7 @@ impl ShmMode for Opener {
 ///
 /// | Property | Requirement | Rationale |
 /// |----------|-------------|-----------|
-/// | **Initialization** | `Default` for types used with `create()` | Provides canonical "empty" initial state |
+/// | **Initialization** | In-place initializer provided to `create()` | Avoids stack overflow for large types by writing directly to mmap'd memory |
 /// | **Layout** | `#[repr(C)]` or `#[repr(transparent)]` | Processes may be compiled separately; `#[repr(Rust)]` is unstable |
 /// | **Pointers** | No heap/stack pointers or references | Virtual addresses don't transfer across process boundaries |
 /// | **Fields** | All fields are `SharedMemorySafe` | Safety constraints apply recursively to nested types |
@@ -309,12 +319,13 @@ impl ShmMode for Opener {
 ///
 /// ## Detailed Requirements
 ///
-/// ### Default-Initialization
+/// ### In-Place Initialization
 ///
-/// Types used with [`Shm::create()`] must implement `Default`. The default value should
-/// represent the canonical "empty" or initial state (e.g., head=0, tail=0 for ring buffers,
-/// counters at 0, flags false). This initialization happens once when the shared memory
-/// is created.
+/// Types used with [`Shm::create()`] must provide an initialization closure that writes
+/// fields directly into the mmap'd memory. This avoids stack overflow for large types
+/// (e.g., types with multi-MB embedded arrays). The typical pattern is to define an
+/// `unsafe fn init_shared(ptr: *mut Self)` method that uses `std::ptr::addr_of_mut!`
+/// to initialize each field individually.
 ///
 /// ### Layout Stability
 ///
@@ -370,7 +381,9 @@ impl ShmMode for Opener {
 /// # use titan::ipc::shmem::*;
 /// struct MyType { x: u32 }
 /// //  Error: MyType doesn't implement SharedMemorySafe
-/// let shm = Shm::<MyType, Creator>::create("/test")?;
+/// let shm = Shm::<MyType, Creator>::create("/test", |ptr| unsafe {
+///     std::ptr::write(ptr, MyType { x: 0 });
+/// })?;
 /// # Ok::<(), ShmError>(())
 /// ```
 ///
@@ -479,10 +492,16 @@ unsafe impl<T: SharedMemorySafe, const N: usize> SharedMemorySafe for [T; N] {}
 /// # use std::sync::atomic::AtomicU64;
 /// # #[repr(C)] struct Counter { value: AtomicU64 }
 /// # unsafe impl SharedMemorySafe for Counter {}
-/// # impl Default for Counter { fn default() -> Self { Self { value: AtomicU64::new(0) } } }
+/// # impl Counter {
+/// #     unsafe fn init_shared(ptr: *mut Self) {
+/// #         std::ptr::addr_of_mut!((*ptr).value).write(AtomicU64::new(0));
+/// #     }
+/// # }
 /// use std::sync::atomic::Ordering;
 ///
-/// let counter = Shm::<Counter, Creator>::create("/counter")?;
+/// let counter = Shm::<Counter, Creator>::create("/counter", |ptr| unsafe {
+///     Counter::init_shared(ptr);
+/// })?;
 /// counter.value.store(42, Ordering::Release);
 /// # Ok::<(), ShmError>(())
 /// ```
@@ -559,17 +578,27 @@ fn validate_shm_path(path: &str) -> Result<()> {
 }
 
 // Constructor for Creator mode
-impl<T: SharedMemorySafe + Default> Shm<T, Creator> {
-    /// Creates new shared memory and maps it into the address space.
+impl<T: SharedMemorySafe> Shm<T, Creator> {
+    /// Creates new shared memory and initializes it in place.
     ///
-    /// This creates a new POSIX shared memory object with the given name, resizes it
-    /// to hold `T`, and maps it with read-write permissions. On drop, the memory will
-    /// be unmapped and the name will be unlinked.
+    /// This function mmaps shared memory and calls the provided initializer with
+    /// a raw pointer to the uninitialized region. The initializer must fully
+    /// initialize all bytes of `T` to avoid undefined behavior.
+    ///
+    /// This design avoids stack allocation of large types by letting callers write
+    /// directly into the mmap'd region field-by-field.
     ///
     /// # Arguments
     ///
     /// * `path` - The shared memory object name (e.g., `"/my-shm"`). Must start with `/`
     ///   and contain no other slashes (see POSIX `shm_open` requirements).
+    /// * `init` - Closure that initializes the memory at the provided pointer.
+    ///
+    /// # Safety
+    ///
+    /// The `init` closure is responsible for fully initializing the memory. Failing
+    /// to initialize all fields will result in undefined behavior when accessing the
+    /// shared memory.
     ///
     /// # Errors
     ///
@@ -583,9 +612,8 @@ impl<T: SharedMemorySafe + Default> Shm<T, Creator> {
     ///
     /// # Panics
     ///
-    /// Panics if `T::default()` panics during initialization. The shared memory
-    /// object will be properly cleaned up (unmapped and unlinked) before the panic
-    /// propagates.
+    /// Panics if the `init` closure panics. The shared memory object will be
+    /// properly cleaned up (unmapped and unlinked) before the panic propagates.
     ///
     /// # Examples
     ///
@@ -594,11 +622,21 @@ impl<T: SharedMemorySafe + Default> Shm<T, Creator> {
     /// # use std::sync::atomic::AtomicU64;
     /// # #[repr(C)] struct Counter { value: AtomicU64 }
     /// # unsafe impl SharedMemorySafe for Counter {}
-    /// # impl Default for Counter { fn default() -> Self { Self { value: AtomicU64::new(0) } } }
-    /// let counter = Shm::<Counter, Creator>::create("/my-counter")?;
+    /// # impl Counter {
+    /// #     unsafe fn init_shared(ptr: *mut Self) {
+    /// #         std::ptr::addr_of_mut!((*ptr).value).write(AtomicU64::new(0));
+    /// #     }
+    /// # }
+    /// // Initialize in-place without stack allocation
+    /// let counter = Shm::<Counter, Creator>::create("/my-counter", |ptr| unsafe {
+    ///     Counter::init_shared(ptr);
+    /// })?;
     /// # Ok::<(), ShmError>(())
     /// ```
-    pub fn create(path: &str) -> Result<Self> {
+    pub fn create<F>(path: &str, init: F) -> Result<Self>
+    where
+        F: FnOnce(*mut T),
+    {
         validate_shm_path(path)?;
 
         let fd = shm::open(
@@ -609,22 +647,10 @@ impl<T: SharedMemorySafe + Default> Shm<T, Creator> {
         .map_err(|err| ShmError::posix("shm_open", path, err))?;
 
         if let Err(e) = ftruncate(&fd, size_of::<T>() as u64) {
-            // Clean up on error
-            drop(fd);
             let _ = shm::unlink(path);
             return Err(ShmError::posix("ftruncate", path, e));
         }
 
-        // Map into our address space
-        //
-        // SAFETY: We are creating a new independent mapping that doesn't alias
-        // any existing Rust objects:
-        // - Allocated: mmap will allocate exactly size_of::<T>() bytes from kernel
-        // - Size valid: ftruncate succeeded, so object is correct size
-        // - FD valid: shm_open succeeded, fd refers to valid shared memory object
-        // - Aligned: mmap returns page-aligned addresses (typically 4KB), satisfying any T's alignment
-        // - No aliasing: Fresh mapping from kernel, not overlapping existing memory
-        // - Permissions: READ|WRITE for interior mutability via atomics
         let ptr_result = unsafe {
             mmap(
                 null_mut(),
@@ -635,17 +661,15 @@ impl<T: SharedMemorySafe + Default> Shm<T, Creator> {
                 0,
             )
         };
+
         let ptr = match ptr_result {
             Ok(p) => p,
             Err(err) => {
-                // Clean up on mmap failure
-                drop(fd);
                 let _ = shm::unlink(path);
                 return Err(ShmError::posix("mmap", path, err));
             }
         };
 
-        // SAFETY: mmap never returns null on success, so this is safe to wrap in NonNull
         let ptr = unsafe { NonNull::new_unchecked(ptr as *mut T) };
 
         let shm = Self {
@@ -655,9 +679,7 @@ impl<T: SharedMemorySafe + Default> Shm<T, Creator> {
             _mode: PhantomData,
         };
 
-        let init_result = catch_unwind(AssertUnwindSafe(|| unsafe {
-            std::ptr::write(shm.ptr.as_ptr(), T::default());
-        }));
+        let init_result = catch_unwind(AssertUnwindSafe(|| init(shm.ptr.as_ptr())));
 
         match init_result {
             Ok(()) => Ok(shm),
@@ -711,13 +733,13 @@ impl<T: SharedMemorySafe> Shm<T, Opener> {
         let stat = match fstat(&fd) {
             Ok(stat) => stat,
             Err(err) => {
-                drop(fd);
                 return Err(ShmError::posix("fstat", path, err));
             }
         };
+
         let expected_size = size_of::<T>() as i64;
+
         if stat.st_size != expected_size {
-            drop(fd);
             return Err(ShmError::SizeMismatch {
                 path: path.to_string(),
                 expected: size_of::<T>(),
@@ -747,10 +769,10 @@ impl<T: SharedMemorySafe> Shm<T, Opener> {
                 0,
             )
         };
+
         let ptr = match ptr_result {
             Ok(p) => p,
             Err(err) => {
-                drop(fd);
                 return Err(ShmError::posix("mmap", path, err));
             }
         };
@@ -790,7 +812,6 @@ impl<T: SharedMemorySafe, Mode: ShmMode> Deref for Shm<T, Mode> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,10 +826,10 @@ mod tests {
             value: AtomicU64,
         }
 
-        impl Default for Counter {
-            fn default() -> Self {
-                Self {
-                    value: AtomicU64::new(0),
+        impl Counter {
+            unsafe fn init_shared(ptr: *mut Self) {
+                unsafe {
+                    std::ptr::addr_of_mut!((*ptr).value).write(AtomicU64::new(0));
                 }
             }
         }
@@ -818,7 +839,9 @@ mod tests {
         // Clean up any leftover
         let _ = shm::unlink(path);
 
-        let counter = match Shm::<Counter, Creator>::create(path) {
+        let counter = match Shm::<Counter, Creator>::create(path, |ptr| unsafe {
+            Counter::init_shared(ptr);
+        }) {
             Ok(counter) => counter,
             Err(err @ ShmError::PosixError { source, .. }) if source == io::Errno::ACCESS => {
                 eprintln!("Skipping test_shm_create_and_drop: {err}");
@@ -844,11 +867,11 @@ mod tests {
             flag: AtomicBool,
         }
 
-        impl Default for SharedData {
-            fn default() -> Self {
-                Self {
-                    counter: AtomicU64::new(0),
-                    flag: AtomicBool::new(false),
+        impl SharedData {
+            unsafe fn init_shared(ptr: *mut Self) {
+                unsafe {
+                    std::ptr::addr_of_mut!((*ptr).counter).write(AtomicU64::new(0));
+                    std::ptr::addr_of_mut!((*ptr).flag).write(AtomicBool::new(false));
                 }
             }
         }
@@ -859,11 +882,11 @@ mod tests {
 
         // Creator process
         {
-            let data = match Shm::<SharedData, Creator>::create(path) {
+            let data = match Shm::<SharedData, Creator>::create(path, |ptr| unsafe {
+                SharedData::init_shared(ptr);
+            }) {
                 Ok(data) => data,
-                Err(err @ ShmError::PosixError { source, .. })
-                    if source == io::Errno::ACCESS =>
-                {
+                Err(err @ ShmError::PosixError { source, .. }) if source == io::Errno::ACCESS => {
                     eprintln!("Skipping test_shm_creator_and_user: {err}");
                     return Ok(());
                 }
@@ -958,10 +981,10 @@ mod tests {
             c: AtomicU64,
         }
 
-        impl Default for Small {
-            fn default() -> Self {
-                Self {
-                    value: AtomicU64::new(0),
+        impl Small {
+            unsafe fn init_shared(ptr: *mut Self) {
+                unsafe {
+                    std::ptr::addr_of_mut!((*ptr).value).write(AtomicU64::new(0));
                 }
             }
         }
@@ -971,7 +994,9 @@ mod tests {
         let _ = shm::unlink(path);
 
         // Create with Small type
-        let _small = match Shm::<Small, Creator>::create(path) {
+        let _small = match Shm::<Small, Creator>::create(path, |ptr| unsafe {
+            Small::init_shared(ptr);
+        }) {
             Ok(shm) => shm,
             Err(err @ ShmError::PosixError { source, .. }) if source == io::Errno::ACCESS => {
                 eprintln!("Skipping test_shm_open_size_mismatch: {err}");
@@ -984,9 +1009,7 @@ mod tests {
         let result = Shm::<Large, Opener>::open(path);
         match result {
             Err(ShmError::SizeMismatch {
-                expected,
-                actual,
-                ..
+                expected, actual, ..
             }) => {
                 assert_eq!(expected, std::mem::size_of::<Large>());
                 assert_eq!(actual, std::mem::size_of::<Small>() as i64);
