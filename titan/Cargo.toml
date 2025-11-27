@@ -4,8 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+core_affinity = "0.8.3"
 rustix.workspace = true
 titan-derive = { path = "../titan-derive" }
 
 [dev-dependencies]
 trybuild.workspace = true
+
+[[bin]]
+name = "spsc_bench"
+path = "src/bin/spsc_bench.rs"
