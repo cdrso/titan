@@ -1,22 +1,22 @@
 //! SPSC queue throughput and latency benchmark.
 //!
 //! Usage:
-//!     cargo run --release --bin spsc_bench
+//!     cargo run --release --bin `spsc_bench`
 //!
 //! Environment variables:
-//!     PRODUCER_CPU=0  Pin producer to CPU 0 (default: 0)
-//!     CONSUMER_CPU=2  Pin consumer to CPU 2 (default: 2)
+//!     `PRODUCER_CPU=0`  Pin producer to CPU 0 (default: 0)
+//!     `CONSUMER_CPU=2`  Pin consumer to CPU 2 (default: 2)
 
 use std::env;
 use std::hint;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use titan::ipc::spsc::{Consumer, Producer};
 
-const QUEUE_SIZE: usize = 1 << 24;
-const ITERATIONS: usize = 1 << 24;
+const QUEUE_SIZE: usize = 10_000_000;
+const ITERATIONS: usize = 10_000_000;
 
 type Payload = i32;
 
@@ -65,15 +65,8 @@ fn bench_throughput(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
         ready_clone.store(true, Ordering::Release);
 
         for expected in 0..ITERATIONS as Payload {
-            loop {
-                if let Some(value) = consumer.pop() {
-                    if value != expected {
-                        panic!("Data corruption: expected {}, got {}", expected, value);
-                    }
-                    break;
-                }
-                hint::spin_loop();
-            }
+            let value = consumer.pop_blocking();
+            assert_eq!(value, expected, "Data corruption");
         }
     });
 
@@ -87,14 +80,14 @@ fn bench_throughput(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
     let start = Instant::now();
 
     for i in 0..ITERATIONS as Payload {
-        producer.push(i).unwrap(); // Queue is large enough, should never fail
+        producer.push_blocking(i);
     }
 
     consumer_thread.join().unwrap();
     let elapsed = start.elapsed();
 
     let ops_per_ms = ITERATIONS as u128 * 1_000_000 / elapsed.as_nanos();
-    println!("{} ops/ms", ops_per_ms);
+    println!("{ops_per_ms} ops/ms");
 }
 
 fn bench_rtt(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
@@ -118,13 +111,8 @@ fn bench_rtt(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
         ready_clone.store(true, Ordering::Release);
 
         for _ in 0..ITERATIONS {
-            loop {
-                if let Some(value) = q1_consumer.pop() {
-                    q2_producer.push(value).unwrap();
-                    break;
-                }
-                hint::spin_loop();
-            }
+            let value = q1_consumer.pop_blocking();
+            q2_producer.push_blocking(value);
         }
     });
 
@@ -141,26 +129,21 @@ fn bench_rtt(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
     let start = Instant::now();
 
     for i in 0..ITERATIONS as Payload {
-        q1_producer.push(i).unwrap();
-        loop {
-            if q2_consumer.pop().is_some() {
-                break;
-            }
-            hint::spin_loop();
-        }
+        q1_producer.push_blocking(i);
+        let _ = q2_consumer.pop_blocking();
     }
 
     let elapsed = start.elapsed();
     responder.join().unwrap();
 
     let rtt_ns = elapsed.as_nanos() / ITERATIONS as u128;
-    println!("{} ns RTT", rtt_ns);
+    println!("{rtt_ns} ns RTT");
 }
 
 fn main() {
     let (producer_cpu, consumer_cpu) = get_cpu_affinity();
 
-    println!("titan SPSC (size={}, iters={}):", QUEUE_SIZE, ITERATIONS);
+    println!("titan SPSC (size={QUEUE_SIZE}, iters={ITERATIONS}):");
     bench_throughput(producer_cpu, consumer_cpu);
     bench_rtt(producer_cpu, consumer_cpu);
 }

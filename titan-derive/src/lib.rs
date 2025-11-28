@@ -82,7 +82,7 @@ use syn::{
 pub fn derive_shared_memory_safe(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
-    match derive_shared_memory_safe_impl(input) {
+    match derive_shared_memory_safe_impl(&input) {
         Ok(tokens) => tokens,
         Err(err) => err.to_compile_error().into(),
     }
@@ -90,21 +90,18 @@ pub fn derive_shared_memory_safe(input: TokenStream) -> TokenStream {
 
 fn get_crate_path() -> proc_macro2::TokenStream {
     match crate_name("titan") {
-        Ok(FoundCrate::Itself) => {
-            quote!(::titan)
-        }
         Ok(FoundCrate::Name(name)) => {
             let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
             quote!(::#ident)
         }
-        Err(_) => {
+        Ok(FoundCrate::Itself) | Err(_) => {
             quote!(::titan)
         }
     }
 }
 
-fn derive_shared_memory_safe_impl(input: DeriveInput) -> syn::Result<TokenStream> {
-    check_repr(&input)?;
+fn derive_shared_memory_safe_impl(input: &DeriveInput) -> syn::Result<TokenStream> {
+    check_repr(input)?;
 
     let field_types = get_field_types(&input.data)?;
     field_types.iter().try_for_each(check_types)?;

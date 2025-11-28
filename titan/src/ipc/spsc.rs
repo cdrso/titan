@@ -69,11 +69,18 @@
 //! │  - tail: AtomicUsize                   │
 //! │  - cached_head: usize                  │
 //! ├────────────────────────────────────────┤
+//! │ Padding (64 bytes)                     │
+//! │  - Prevents false sharing              │
+//! ├────────────────────────────────────────┤
 //! │ Buffer: [Slot<T>; N]                   │
 //! │  - Slot 0                              │
 //! │  - Slot 1                              │
 //! │  - ...                                 │
 //! │  - Slot N-1                            │
+//! ├────────────────────────────────────────┤
+//! │ Padding (64 bytes)                     │
+//! │  - Prevents false sharing with         │
+//! │    adjacent shared memory regions      │
 //! └────────────────────────────────────────┘
 //! ```
 
@@ -105,7 +112,7 @@ impl<T, Role> SpscCell<T, Role> {
         Self(UnsafeCell::new(value), PhantomData)
     }
 
-    fn get(&self) -> &UnsafeCell<T> {
+    const fn get(&self) -> &UnsafeCell<T> {
         &self.0
     }
 }
@@ -174,7 +181,6 @@ impl Default for ConsumerState {
     }
 }
 
-
 #[derive(SharedMemorySafe)]
 #[repr(C)]
 #[repr(align(64))]
@@ -198,12 +204,19 @@ struct SpscQueue<T: SharedMemorySafe, const N: usize> {
     /// Consumer state (tail index + cached head).
     consumer: ConsumerState,
 
-    /// Ring buffer slots (uninitialized until written by producer).
+    /// Prevent false sharing between consumer state and buffer.
+    _padding_0: [u8; 64],
+
+    /// Ring buffer slots.
     buffer: [Slot<T>; N],
+
+    /// Prevent false sharing with adjacent shared memory regions.
+    _padding_1: [u8; 64],
 }
 
 impl<T: SharedMemorySafe, const N: usize> SpscQueue<T, N> {
-    #[inline(always)]
+    /// Computes buffer index from sequence number.
+    #[inline]
     const fn slot_index(idx: usize) -> usize {
         idx % N
     }
@@ -228,9 +241,17 @@ impl<T: SharedMemorySafe, const N: usize> SpscQueue<T, N> {
         // We use addr_of_mut! to write fields without creating intermediate references,
         // which would be UB for uninitialized memory.
         unsafe {
+            // Initialize init field
+            std::ptr::addr_of_mut!((*ptr).init).write(InitMarker(AtomicU64::new(0)));
+            // Initialize producer and consumer state
             std::ptr::addr_of_mut!((*ptr).producer).write(ProducerState::default());
             std::ptr::addr_of_mut!((*ptr).consumer).write(ConsumerState::default());
-            (*ptr).init.0.store(INIT_MAGIC, std::sync::atomic::Ordering::Release);
+
+            // Release store to signal initialization complete.
+            (*ptr)
+                .init
+                .0
+                .store(INIT_MAGIC, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -338,6 +359,10 @@ impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Creator> {
     /// - Insufficient permissions to create shared memory
     /// - System limits reached (file descriptors, memory)
     ///
+    /// # Panics
+    ///
+    /// Panics if `N` (queue capacity) is 0. The capacity must be at least 1.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -346,6 +371,7 @@ impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Creator> {
     /// # Ok::<(), titan::ipc::shmem::ShmError>(())
     /// ```
     pub fn create(path: &str) -> Result<Self, ShmError> {
+        assert!(N > 0, "Queue capacity must be greater than 0");
         let shm = Shm::<SpscQueue<T, N>, Creator>::create(path, |ptr| unsafe {
             SpscQueue::<T, N>::init_shared(ptr);
         })?;
@@ -376,6 +402,10 @@ impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Opener> {
     /// - Size mismatch (different capacity used by creator)
     /// - Initialization timeout (creator didn't finish within 1 second)
     ///
+    /// # Panics
+    ///
+    /// Panics if `N` (queue capacity) is 0. The capacity must be at least 1.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -385,14 +415,17 @@ impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Opener> {
     /// # Ok::<(), titan::ipc::shmem::ShmError>(())
     /// ```
     pub fn open(path: &str) -> Result<Self, ShmError> {
+        assert!(N > 0, "Queue capacity must be greater than 0");
         let shm = Shm::<SpscQueue<T, N>, Opener>::open(path)?;
         // SAFETY: Shm::open guarantees the returned pointer is:
         // - Non-null and well-aligned (mmap guarantees page alignment)
         // - Points to mapped memory of exactly size_of::<SpscQueue<T, N>>() bytes
         // - Valid for reads (mapped with PROT_READ | PROT_WRITE)
         // The memory remains mapped for the lifetime of `shm`.
-        if !unsafe { SpscQueue::<T, N>::wait_for_init(&*shm, INIT_TIMEOUT) } {
-            return Err(ShmError::InitTimeout { path: path.to_string() });
+        if !unsafe { SpscQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) } {
+            return Err(ShmError::InitTimeout {
+                path: path.to_string(),
+            });
         }
         Ok(Self {
             shm,
@@ -407,14 +440,14 @@ impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Producer<T, N, Mode> {
     /// This is a wait-free operation that completes in bounded time. If the queue is
     /// full, the item is returned immediately without blocking.
     ///
-    /// # Returns
-    ///
-    /// - `Ok(())` - Item was successfully pushed
-    /// - `Err(item)` - Queue is full, item returned
-    ///
     /// The producer caches the consumer's tail index to avoid atomic loads on every push.
     /// When the cached value indicates the queue is full, the actual tail is re-loaded
     /// before returning an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(item)` if the queue is full. The item is returned unchanged so it
+    /// can be retried or handled by the caller.
     ///
     /// # Examples
     ///
@@ -431,6 +464,7 @@ impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Producer<T, N, Mode> {
     /// }
     /// # Ok::<(), titan::ipc::shmem::ShmError>(())
     /// ```
+    #[inline]
     pub fn push(&self, item: T) -> Result<(), T> {
         use std::sync::atomic::Ordering;
 
@@ -476,6 +510,34 @@ impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Producer<T, N, Mode> {
             .store(head.wrapping_add(1), Ordering::Release);
 
         Ok(())
+    }
+
+    /// Blocks until space is available, then pushes the item.
+    ///
+    /// This spins using `std::hint::spin_loop()` when the queue is full,
+    /// which is efficient for short wait times. For longer waits, consider
+    /// using external synchronization (e.g., eventfd).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use titan::ipc::spsc::Producer;
+    /// # let producer = Producer::<u64, 4, _>::create("/test")?;
+    /// // Always succeeds (waits if needed)
+    /// producer.push_blocking(42);
+    /// # Ok::<(), titan::ipc::shmem::ShmError>(())
+    /// ```
+    #[inline]
+    pub fn push_blocking(&self, mut item: T) {
+        loop {
+            match self.push(item) {
+                Ok(()) => return,
+                Err(returned) => {
+                    item = returned;
+                    std::hint::spin_loop();
+                }
+            }
+        }
     }
 }
 
@@ -539,6 +601,11 @@ impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Creator> {
     /// - Shared memory object already exists at `path`
     /// - Insufficient permissions to create shared memory
     /// - System limits reached (file descriptors, memory)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `N` (queue capacity) is 0. The capacity must be at least 1.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -548,6 +615,7 @@ impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Creator> {
     /// # Ok::<(), titan::ipc::shmem::ShmError>(())
     /// ```
     pub fn create(path: &str) -> Result<Self, ShmError> {
+        assert!(N > 0, "Queue capacity must be greater than 0");
         let shm = Shm::<SpscQueue<T, N>, Creator>::create(path, |ptr| unsafe {
             SpscQueue::<T, N>::init_shared(ptr);
         })?;
@@ -578,6 +646,10 @@ impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Opener> {
     /// - Size mismatch (different capacity used by creator)
     /// - Initialization timeout (creator didn't finish within 1 second)
     ///
+    /// # Panics
+    ///
+    /// Panics if `N` (queue capacity) is 0. The capacity must be at least 1.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -587,14 +659,17 @@ impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Opener> {
     /// # Ok::<(), titan::ipc::shmem::ShmError>(())
     /// ```
     pub fn open(path: &str) -> Result<Self, ShmError> {
+        assert!(N > 0, "Queue capacity must be greater than 0");
         let shm = Shm::<SpscQueue<T, N>, Opener>::open(path)?;
         // SAFETY: Shm::open guarantees the returned pointer is:
         // - Non-null and well-aligned (mmap guarantees page alignment)
         // - Points to mapped memory of exactly size_of::<SpscQueue<T, N>>() bytes
         // - Valid for reads (mapped with PROT_READ | PROT_WRITE)
         // The memory remains mapped for the lifetime of `shm`.
-        if !unsafe { SpscQueue::<T, N>::wait_for_init(&*shm, INIT_TIMEOUT) } {
-            return Err(ShmError::InitTimeout { path: path.to_string() });
+        if !unsafe { SpscQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) } {
+            return Err(ShmError::InitTimeout {
+                path: path.to_string(),
+            });
         }
         Ok(Self {
             shm,
@@ -639,6 +714,8 @@ impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Consumer<T, N, Mode> {
     /// }
     /// # Ok::<(), titan::ipc::shmem::ShmError>(())
     /// ```
+    #[inline]
+    #[must_use]
     pub fn pop(&self) -> Option<T> {
         use std::sync::atomic::Ordering;
 
@@ -686,6 +763,33 @@ impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Consumer<T, N, Mode> {
 
         Some(item)
     }
+
+    /// Blocks until an item is available, then pops and returns it.
+    ///
+    /// This spins using `std::hint::spin_loop()` when the queue is empty,
+    /// which is efficient for short wait times. For longer waits, consider
+    /// using external synchronization (e.g., eventfd).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use titan::ipc::spsc::Consumer;
+    /// # let consumer = Consumer::<u64, 4, _>::create("/test")?;
+    /// // Always succeeds (waits if needed)
+    /// let value = consumer.pop_blocking();
+    /// println!("Received: {}", value);
+    /// # Ok::<(), titan::ipc::shmem::ShmError>(())
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn pop_blocking(&self) -> T {
+        loop {
+            if let Some(item) = self.pop() {
+                return item;
+            }
+            std::hint::spin_loop();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -723,15 +827,20 @@ mod tests {
     fn test_buffer_starts_on_separate_cache_line() {
         use std::mem::{offset_of, size_of};
 
+        type TestQueue = SpscQueue<u64, 16>;
+
         // Verify InitMarker, ProducerState and ConsumerState each take exactly one cache line
         assert_eq!(size_of::<InitMarker>(), CACHE_LINE_SIZE);
         assert_eq!(size_of::<ProducerState>(), CACHE_LINE_SIZE);
         assert_eq!(size_of::<ConsumerState>(), CACHE_LINE_SIZE);
 
-        // Verify buffer starts at offset 192 (4th cache line)
+        // Verify padding before buffer is one cache line
+        assert_eq!(size_of::<[u8; 64]>(), CACHE_LINE_SIZE);
+
+        // Verify buffer starts at offset 256 (5th cache line)
+        // Layout: InitMarker(64) + ProducerState(64) + ConsumerState(64) + Padding(64) + Buffer
         // This ensures no false sharing between consumer and buffer
-        type TestQueue = SpscQueue<u64, 16>;
-        assert_eq!(offset_of!(TestQueue, buffer), 3 * CACHE_LINE_SIZE);
+        assert_eq!(offset_of!(TestQueue, buffer), 4 * CACHE_LINE_SIZE);
     }
 
     #[test]
@@ -775,7 +884,7 @@ mod tests {
 
         // Fill the queue (capacity is 4)
         for i in 0..4 {
-            assert!(producer.push(i).is_ok(), "Failed to push item {}", i);
+            assert!(producer.push(i).is_ok(), "Failed to push item {i}");
         }
 
         // Next push should fail (queue full)

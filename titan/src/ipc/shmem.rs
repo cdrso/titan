@@ -65,7 +65,7 @@
 //! - **Typestate pattern**: [`Creator`] vs [`Opener`] enforces cleanup semantics
 //! - **RAII**: Drop automatically unmaps memory and unlinks names
 //!
-//! # Implementing SharedMemorySafe
+//! # Implementing `SharedMemorySafe`
 //!
 //! The trait is automatically implemented for primitives, atomics, and arrays.
 //! For custom types, use the `#[derive(SharedMemorySafe)]` macro:
@@ -113,7 +113,7 @@
 //! See the [module-level discussion](self#cleanup-and-crash-handling) for details.
 
 use rustix::fs::{Mode, fstat, ftruncate};
-use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
+use rustix::mm::{Advice, MapFlags, ProtFlags, madvise, mmap, munmap};
 use rustix::{io, shm};
 use std::fmt;
 use std::marker::PhantomData;
@@ -121,7 +121,10 @@ use std::mem::size_of;
 use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr::{NonNull, null_mut};
-use std::sync::atomic::*;
+use std::sync::atomic::{
+    AtomicBool, AtomicI8, AtomicI16, AtomicI32, AtomicI64, AtomicIsize, AtomicU8, AtomicU16,
+    AtomicU32, AtomicU64, AtomicUsize,
+};
 
 /// Result alias for shared memory operations.
 pub type Result<T> = std::result::Result<T, ShmError>;
@@ -160,23 +163,22 @@ impl ShmError {
 impl fmt::Display for ShmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ShmError::InvalidPath { path, reason } => {
-                write!(f, "invalid shared memory path `{}`: {}", path, reason)
+            Self::InvalidPath { path, reason } => {
+                write!(f, "invalid shared memory path `{path}`: {reason}")
             }
-            ShmError::PosixError { op, path, source } => {
-                write!(f, "{} failed for `{}`: {}", op, path, source)
+            Self::PosixError { op, path, source } => {
+                write!(f, "{op} failed for `{path}`: {source}")
             }
-            ShmError::SizeMismatch {
+            Self::SizeMismatch {
                 path,
                 expected,
                 actual,
             } => write!(
                 f,
-                "shared memory `{}` size mismatch: expected {} bytes, got {}",
-                path, expected, actual
+                "shared memory `{path}` size mismatch: expected {expected} bytes, got {actual}"
             ),
-            ShmError::InitTimeout { path } => {
-                write!(f, "timed out waiting for `{}` to be initialized", path)
+            Self::InitTimeout { path } => {
+                write!(f, "timed out waiting for `{path}` to be initialized")
             }
         }
     }
@@ -185,7 +187,7 @@ impl fmt::Display for ShmError {
 impl std::error::Error for ShmError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ShmError::PosixError { source, .. } => Some(source),
+            Self::PosixError { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -569,12 +571,12 @@ unsafe impl<T: SharedMemorySafe, Mode: ShmMode> Sync for Shm<T, Mode> {}
 
 const POSIX_NAME_MAX: usize = 255;
 
-/// Validates that a path meets POSIX shm_open requirements.
+/// Validates that a path meets POSIX `shm_open` requirements.
 ///
 /// For portable use, POSIX requires:
 /// - Must start with '/'
 /// - Must not contain additional slashes after the first
-/// - Must not exceed NAME_MAX (255 characters)
+/// - Must not exceed `NAME_MAX` (255 characters)
 fn validate_shm_path(path: &str) -> Result<()> {
     if !path.starts_with('/') {
         return Err(ShmError::InvalidPath {
@@ -697,9 +699,14 @@ impl<T: SharedMemorySafe> Shm<T, Creator> {
             }
         };
 
+        // Best-effort huge page hint; ignored if unsupported.
+        unsafe {
+            let _ = madvise(ptr, size_of::<T>(), Advice::LinuxHugepage);
+        }
+
         // SAFETY: mmap returns a non-null pointer on success (checked above via Ok branch),
         // and the pointer is properly aligned for T as guaranteed by mmap for page-aligned memory
-        let ptr = unsafe { NonNull::new_unchecked(ptr as *mut T) };
+        let ptr = unsafe { NonNull::new_unchecked(ptr.cast::<T>()) };
 
         let shm = Self {
             ptr,
@@ -766,9 +773,15 @@ impl<T: SharedMemorySafe> Shm<T, Opener> {
             }
         };
 
-        let expected_size = size_of::<T>() as i64;
+        let expected_size = size_of::<T>();
 
-        if stat.st_size != expected_size {
+        let actual_size = usize::try_from(stat.st_size).map_err(|_| ShmError::PosixError {
+            op: "fstat",
+            path: path.to_string(),
+            source: io::Errno::INVAL,
+        })?;
+
+        if actual_size != expected_size {
             return Err(ShmError::SizeMismatch {
                 path: path.to_string(),
                 expected: size_of::<T>(),
@@ -805,8 +818,13 @@ impl<T: SharedMemorySafe> Shm<T, Opener> {
             }
         };
 
+        // Best-effort huge page hint; ignored if unsupported.
+        unsafe {
+            let _ = madvise(ptr, size_of::<T>(), Advice::LinuxHugepage);
+        }
+
         // SAFETY: mmap never returns null on success, so this is safe to wrap in NonNull
-        let ptr = unsafe { NonNull::new_unchecked(ptr as *mut T) };
+        let ptr = unsafe { NonNull::new_unchecked(ptr.cast::<T>()) };
 
         Ok(Self {
             ptr,
@@ -825,7 +843,7 @@ impl<T: SharedMemorySafe, Mode: ShmMode> Drop for Shm<T, Mode> {
         // The memory region is still valid as we're in drop, meaning no other
         // code has unmapped it yet
         unsafe {
-            let _ = munmap(self.ptr.as_ptr() as *mut _, self.size);
+            let _ = munmap(self.ptr.as_ptr().cast(), self.size);
         }
 
         if Mode::SHOULD_UNLINK {
@@ -836,6 +854,7 @@ impl<T: SharedMemorySafe, Mode: ShmMode> Drop for Shm<T, Mode> {
 
 impl<T: SharedMemorySafe, Mode: ShmMode> Deref for Shm<T, Mode> {
     type Target = T;
+    #[inline]
     fn deref(&self) -> &T {
         // SAFETY: ptr is valid for the lifetime of Shm, guaranteed by:
         // 1. mmap succeeded during construction
@@ -848,6 +867,7 @@ impl<T: SharedMemorySafe, Mode: ShmMode> Deref for Shm<T, Mode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn test_shm_create_and_drop() -> Result<()> {
@@ -1045,7 +1065,7 @@ mod tests {
                 expected, actual, ..
             }) => {
                 assert_eq!(expected, std::mem::size_of::<Large>());
-                assert_eq!(actual, std::mem::size_of::<Small>() as i64);
+                assert_eq!(actual, i64::try_from(std::mem::size_of::<Small>()).unwrap());
             }
             Err(e) => panic!("Expected SizeMismatch error, got: {e}"),
             Ok(_) => panic!("Expected SizeMismatch error, but open() succeeded"),
