@@ -63,10 +63,12 @@
 //! ├────────────────────────────────────────┤
 //! │ ProducerState (64-byte aligned)        │
 //! │  - head: AtomicUsize                   │
+//! │  - cursor: usize (head % N)            │
 //! │  - cached_tail: usize                  │
 //! ├────────────────────────────────────────┤
 //! │ ConsumerState (64-byte aligned)        │
 //! │  - tail: AtomicUsize                   │
+//! │  - cursor: usize (tail % N)            │
 //! │  - cached_head: usize                  │
 //! ├────────────────────────────────────────┤
 //! │ Padding (64 bytes)                     │
@@ -147,6 +149,11 @@ struct ProducerState {
     /// Owned by producer, read by consumer.
     head: AtomicUsize,
 
+    /// Producer-local cursor tracking `head % N`.
+    /// Invariant: always in range `[0, N)`.
+    /// Avoids modulo division on each push by incrementing with wrap.
+    cursor: ProducerCache<usize>,
+
     /// Cached copy of tail index.
     cached_tail: ProducerCache<usize>,
 }
@@ -155,6 +162,7 @@ impl Default for ProducerState {
     fn default() -> Self {
         Self {
             head: AtomicUsize::new(0),
+            cursor: ProducerCache::new(0),
             cached_tail: ProducerCache::new(0),
         }
     }
@@ -168,6 +176,11 @@ struct ConsumerState {
     /// Owned by consumer, read by producer.
     tail: AtomicUsize,
 
+    /// Consumer-local cursor tracking `tail % N`.
+    /// Invariant: always in range `[0, N)`.
+    /// Avoids modulo division on each pop by incrementing with wrap.
+    cursor: ConsumerCache<usize>,
+
     /// Cached copy of head index.
     cached_head: ConsumerCache<usize>,
 }
@@ -176,6 +189,7 @@ impl Default for ConsumerState {
     fn default() -> Self {
         Self {
             tail: AtomicUsize::new(0),
+            cursor: ConsumerCache::new(0),
             cached_head: ConsumerCache::new(0),
         }
     }
@@ -215,10 +229,18 @@ struct SpscQueue<T: SharedMemorySafe, const N: usize> {
 }
 
 impl<T: SharedMemorySafe, const N: usize> SpscQueue<T, N> {
-    /// Computes buffer index from sequence number.
+    /// Advances a cursor to the next slot index, wrapping to 0 at capacity.
+    ///
+    /// This is equivalent to `(cursor + 1) % N` but avoids the division instruction,
+    /// using a comparison and conditional move instead.
+    ///
+    /// # Invariant
+    ///
+    /// If `cursor < N`, then the result is also `< N`.
     #[inline]
-    const fn slot_index(idx: usize) -> usize {
-        idx % N
+    const fn bump_cursor(cursor: usize) -> usize {
+        let next = cursor + 1;
+        if next == N { 0 } else { next }
     }
 
     /// Initializes the queue directly inside shared memory.
@@ -492,15 +514,25 @@ impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Producer<T, N, Mode> {
             }
         }
 
-        // Write item to buffer slot
-        let slot_index = SpscQueue::<T, N>::slot_index(head);
-        // SAFETY: The producer owns slot at index `head` because:
-        // - head hasn't been published yet (store happens after this)
-        // - The check above ensures head - tail < N, so this slot isn't being read
-        // - slot_index is always < N due to modulo operation
+        // SAFETY: Producer has exclusive access to its cursor field (ProducerRole marker
+        // ensures this at the type level). The cursor is always in range [0, N) because:
+        // - Initialized to 0
+        // - Only modified by bump_cursor which preserves the invariant
+        let slot_index = unsafe { *queue.producer.cursor.get().get() };
+
+        // SAFETY: The producer owns the slot at `slot_index` because:
+        // - head hasn't been published yet (store happens after this write)
+        // - The check above ensures head - tail < N, so the consumer isn't reading this slot
+        // - slot_index is in [0, N) per the cursor invariant, so the indexing is in bounds
         unsafe {
             let slot_ptr = queue.buffer[slot_index].value.get().get();
             std::ptr::write(slot_ptr, MaybeUninit::new(item));
+        }
+
+        // SAFETY: Producer has exclusive write access to its cursor field.
+        // bump_cursor preserves the [0, N) invariant.
+        unsafe {
+            *queue.producer.cursor.get().get() = SpscQueue::<T, N>::bump_cursor(slot_index);
         }
 
         // Publish the new head (release to sync with consumer)
@@ -743,13 +775,18 @@ impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Consumer<T, N, Mode> {
             }
         }
 
-        let slot_index = SpscQueue::<T, N>::slot_index(tail);
-        // SAFETY: The consumer owns slot at index `tail` because:
+        // SAFETY: Consumer has exclusive access to its cursor field (ConsumerRole marker
+        // ensures this at the type level). The cursor is always in range [0, N) because:
+        // - Initialized to 0
+        // - Only modified by bump_cursor which preserves the invariant
+        let slot_index = unsafe { *queue.consumer.cursor.get().get() };
+
+        // SAFETY: The consumer owns the slot at `slot_index` because:
         // - The check above ensures head != tail, so there's data to read
-        // - tail hasn't been published yet (store happens after this)
-        // - slot_index is always < N due to modulo operation
-        // - The producer won't write to this slot until we publish the new tail
-        // - The slot was initialized by the producer (MaybeUninit is safe to assume_init)
+        // - tail hasn't been published yet (store happens after this read)
+        // - slot_index is in [0, N) per the cursor invariant, so the indexing is in bounds
+        // - The producer won't overwrite this slot until we publish the new tail
+        // - The slot was initialized by the producer (MaybeUninit::assume_init is valid)
         let item = unsafe {
             let slot_ptr = queue.buffer[slot_index].value.get().get();
             std::ptr::read(slot_ptr).assume_init()
@@ -760,6 +797,12 @@ impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Consumer<T, N, Mode> {
             .consumer
             .tail
             .store(tail.wrapping_add(1), Ordering::Release);
+
+        // SAFETY: Consumer has exclusive write access to its cursor field.
+        // bump_cursor preserves the [0, N) invariant.
+        unsafe {
+            *queue.consumer.cursor.get().get() = SpscQueue::<T, N>::bump_cursor(slot_index);
+        }
 
         Some(item)
     }
