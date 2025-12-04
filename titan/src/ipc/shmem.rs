@@ -47,8 +47,8 @@
 //! ```
 
 use rustix::fs::{Mode, fstat, ftruncate};
-use rustix::param::page_size;
 use rustix::mm::{Advice, MapFlags, ProtFlags, madvise, mmap, munmap};
+use rustix::param::page_size;
 use rustix::{io, shm};
 use std::fmt;
 use std::marker::PhantomData;
@@ -379,7 +379,6 @@ unsafe impl<T: SharedMemorySafe, Mode: ShmMode> Send for Shm<T, Mode> {}
 // SAFETY: Multiple threads can hold &Shm<T> if T is Sync.
 // T: SharedMemorySafe already requires Sync.
 unsafe impl<T: SharedMemorySafe, Mode: ShmMode> Sync for Shm<T, Mode> {}
-
 
 /// Validates that a path meets POSIX `shm_open` requirements.
 ///

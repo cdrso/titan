@@ -420,9 +420,7 @@ impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Opener> {
         // - Valid for reads (mapped with PROT_READ | PROT_WRITE)
         // The memory remains mapped for the lifetime of `shm`.
         if !unsafe { SpscQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) } {
-            return Err(ShmError::InitTimeout {
-                path: path.into(),
-            });
+            return Err(ShmError::InitTimeout { path: path.into() });
         }
         Ok(Self {
             shm,
@@ -567,9 +565,7 @@ impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Opener> {
         // - Valid for reads (mapped with PROT_READ | PROT_WRITE)
         // The memory remains mapped for the lifetime of `shm`.
         if !unsafe { SpscQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) } {
-            return Err(ShmError::InitTimeout {
-                path: path.into(),
-            });
+            return Err(ShmError::InitTimeout { path: path.into() });
         }
         Ok(Self {
             shm,
