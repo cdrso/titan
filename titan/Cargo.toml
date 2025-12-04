@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 core_affinity = "0.8.3"
+minstant = { version = "0.1.7", features = ["fallback-coarse"] }
+rand = "0.9.2"
 rustix.workspace = true
 titan-derive = { path = "../titan-derive" }
 
