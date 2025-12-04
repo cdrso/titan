@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use titan::ipc::spsc::{Consumer, Producer};
+use titan::ipc::shmem::ShmPath;
+use titan::ipc::spsc::{Consumer, Producer, Timeout};
 
 const QUEUE_SIZE: usize = 10_000_000;
 const ITERATIONS: usize = 10_000_000;
@@ -49,15 +50,15 @@ fn unique_path(tag: &str) -> String {
 }
 
 fn bench_throughput(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
-    let path = unique_path("throughput");
-    let producer = Producer::<Payload, QUEUE_SIZE, _>::create(&path).unwrap();
+    let path = ShmPath::new(unique_path("throughput")).unwrap();
+    let producer = Producer::<Payload, QUEUE_SIZE, _>::create(path.clone()).unwrap();
 
     let ready = Arc::new(AtomicBool::new(false));
     let ready_clone = ready.clone();
 
     // Consumer thread
     let consumer_thread = std::thread::spawn(move || {
-        let consumer = Consumer::<Payload, QUEUE_SIZE, _>::open(&path).unwrap();
+        let consumer = Consumer::<Payload, QUEUE_SIZE, _>::open(path).unwrap();
         pin_to_cpu(consumer_cpu);
 
         // Signal ready
@@ -65,7 +66,7 @@ fn bench_throughput(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
 
         let iterations = Payload::try_from(ITERATIONS).expect("ITERATIONS exceeds Payload range");
         for expected in 0..iterations {
-            let value = consumer.pop_blocking();
+            let value = consumer.pop_blocking(Timeout::Infinite).unwrap();
             assert_eq!(value, expected, "Data corruption");
         }
     });
@@ -81,7 +82,7 @@ fn bench_throughput(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
 
     let iterations = Payload::try_from(ITERATIONS).expect("ITERATIONS exceeds Payload range");
     for i in 0..iterations {
-        producer.push_blocking(i);
+        producer.push_blocking(i, Timeout::Infinite).unwrap();
     }
 
     consumer_thread.join().unwrap();
@@ -92,27 +93,27 @@ fn bench_throughput(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
 }
 
 fn bench_rtt(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
-    let q1_path = unique_path("q1");
-    let q2_path = unique_path("q2");
+    let q1_path = ShmPath::new(unique_path("q1")).unwrap();
+    let q2_path = ShmPath::new(unique_path("q2")).unwrap();
 
-    let q1_producer = Producer::<Payload, QUEUE_SIZE, _>::create(&q1_path).unwrap();
+    let q1_producer = Producer::<Payload, QUEUE_SIZE, _>::create(q1_path.clone()).unwrap();
 
     let ready = Arc::new(AtomicBool::new(false));
     let ready_clone = ready.clone();
-    let q2_path_clone = q2_path.clone();
+    let q2_path_for_consumer = q2_path.clone();
 
     // Responder thread
     let responder = std::thread::spawn(move || {
-        let q1_consumer = Consumer::<Payload, QUEUE_SIZE, _>::open(&q1_path).unwrap();
-        let q2_producer = Producer::<Payload, QUEUE_SIZE, _>::create(&q2_path_clone).unwrap();
+        let q1_consumer = Consumer::<Payload, QUEUE_SIZE, _>::open(q1_path).unwrap();
+        let q2_producer = Producer::<Payload, QUEUE_SIZE, _>::create(q2_path).unwrap();
         pin_to_cpu(consumer_cpu);
 
         // Signal ready
         ready_clone.store(true, Ordering::Release);
 
         for _ in 0..ITERATIONS {
-            let value = q1_consumer.pop_blocking();
-            q2_producer.push_blocking(value);
+            let value = q1_consumer.pop_blocking(Timeout::Infinite).unwrap();
+            q2_producer.push_blocking(value, Timeout::Infinite).unwrap();
         }
     });
 
@@ -122,7 +123,7 @@ fn bench_rtt(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
     }
 
     // Open q2 after responder created it
-    let q2_consumer = Consumer::<Payload, QUEUE_SIZE, _>::open(&q2_path).unwrap();
+    let q2_consumer = Consumer::<Payload, QUEUE_SIZE, _>::open(q2_path_for_consumer).unwrap();
 
     pin_to_cpu(producer_cpu);
 
@@ -130,8 +131,8 @@ fn bench_rtt(producer_cpu: Option<usize>, consumer_cpu: Option<usize>) {
 
     let iterations = Payload::try_from(ITERATIONS).expect("ITERATIONS exceeds Payload range");
     for i in 0..iterations {
-        q1_producer.push_blocking(i);
-        let _ = q2_consumer.pop_blocking();
+        q1_producer.push_blocking(i, Timeout::Infinite).unwrap();
+        let _ = q2_consumer.pop_blocking(Timeout::Infinite);
     }
 
     let elapsed = start.elapsed();
