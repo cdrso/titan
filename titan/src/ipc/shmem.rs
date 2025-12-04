@@ -151,6 +151,11 @@ pub struct ShmPath(String);
 
 impl ShmPath {
     /// Parses and validates a shared memory path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShmError::InvalidPath`] if the path doesn't start with `/`,
+    /// contains additional `/` characters, or exceeds 255 bytes.
     pub fn new(path: impl Into<String>) -> Result<Self> {
         let path = path.into();
         validate_shm_path(&path)?;
