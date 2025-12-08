@@ -7,11 +7,14 @@ use crate::SharedMemorySafe;
 use crate::ipc::shmem::{ShmError, ShmPath};
 use std::fmt;
 
-/// Capacity of per-client message queues (tx and rx).
-pub const CLIENT_QUEUE_CAPACITY: usize = 1024;
+/// Capacity of per-client control message queues (tx and rx).
+pub const CONTROL_QUEUE_CAPACITY: usize = 1024;
 
 /// Capacity of the driver's inbox for incoming connection requests.
 pub const DRIVER_INBOX_CAPACITY: usize = 256;
+
+/// Capacity of per-client data queues (tx or rx).
+pub const DATA_QUEUE_CAPACITY: usize = 1024;
 
 /// Returns the well-known path for the driver's connection inbox.
 ///
@@ -32,13 +35,24 @@ pub fn driver_inbox_path() -> ShmPath {
 /// Never panics—generated paths are always valid (start with `/`, no extra `/`,
 /// well under 255 bytes).
 #[must_use]
-pub fn channel_paths(id: &ClientId) -> (ShmPath, ShmPath) {
+pub fn control_channel_paths(id: &ClientId) -> (ShmPath, ShmPath) {
     let tx = format!("/titan-{}-{}-tx", id.pid, id.nonce);
     let rx = format!("/titan-{}-{}-rx", id.pid, id.nonce);
     (
         ShmPath::new(tx).expect("generated path is valid"),
         ShmPath::new(rx).expect("generated path is valid"),
     )
+}
+
+/// Generates shared memory path for a data channel.
+#[must_use]
+pub fn data_channel_path(id: &ClientId, channel: u32, dir: DataDirection) -> ShmPath {
+    let suffix = match dir {
+        DataDirection::Tx => "tx",
+        DataDirection::Rx => "rx",
+    };
+    let path = format!("/titan-data-{}-{}-{channel}-{suffix}", id.pid, id.nonce);
+    ShmPath::new(path).expect("generated path is valid")
 }
 
 /// Unique identifier for a client connection.
@@ -71,6 +85,26 @@ pub struct ClientHello {
     pub id: ClientId,
 }
 
+/// Direction of a data channel.
+#[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub enum DataDirection {
+    /// Client outbound data
+    Tx,
+    /// Client inbound data
+    Rx,
+}
+
+/// Request describing a data channel (used for open/close/acks).
+#[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct DataChannelRequest {
+    /// Application-defined channel identifier.
+    pub channel: u32,
+    /// Direction of data flow.
+    pub dir: DataDirection,
+}
+
 /// Commands sent from client to driver during an active session.
 #[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -79,6 +113,10 @@ pub enum ClientCommand {
     Heartbeat,
     /// Graceful disconnect request.
     Disconnect,
+    /// Request a new data channel.
+    OpenDataChannel(DataChannelRequest),
+    /// Close an existing data channel.
+    CloseDataChannel(DataChannelRequest),
 }
 
 /// Messages sent from client to driver.
@@ -123,6 +161,12 @@ pub enum DriverMessage {
     Heartbeat,
     /// Driver is shutting down, client should disconnect.
     Shutdown,
+    /// Data channel is ready to use.
+    DataChannelReady(DataChannelRequest),
+    /// Data channel failed to open.
+    DataChannelError(DataChannelRequest),
+    /// Data channel closed/acknowledged.
+    DataChannelClosed(DataChannelRequest),
 }
 
 /// Errors that can occur during connection establishment or communication.
@@ -158,8 +202,8 @@ impl fmt::Display for ConnectionError {
     }
 }
 
-/// A bidirectional connection between client and driver.
-pub struct Connection<Tx, Rx> {
+/// A bidirectional control connection between client and driver.
+pub struct ControlConnection<Tx, Rx> {
     /// The client's unique identifier.
     pub id: ClientId,
     /// Transmit channel.
@@ -178,7 +222,7 @@ mod tests {
             pid: 12345,
             nonce: 43981, // 0xABCD
         };
-        let (tx, rx) = channel_paths(&id);
+        let (tx, rx) = control_channel_paths(&id);
         assert_eq!(tx.as_ref(), "/titan-12345-43981-tx");
         assert_eq!(rx.as_ref(), "/titan-12345-43981-rx");
     }

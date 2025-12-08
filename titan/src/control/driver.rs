@@ -1,27 +1,32 @@
 //! Driver-side session management for client control connections.
 
+use crate::control::handshake::driver_accept;
+use crate::control::types::{
+    CONTROL_QUEUE_CAPACITY, ClientCommand, ClientId, ClientMessage, ConnectionError,
+    ControlConnection, DATA_QUEUE_CAPACITY, DRIVER_INBOX_CAPACITY, DataChannelRequest,
+    DataDirection, DriverMessage, data_channel_path, driver_inbox_path,
+};
+use crate::data::Frame;
+use crate::ipc::shmem::{Creator, Opener};
+use crate::ipc::spsc::{Consumer, Producer};
+use minstant::Instant;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::control::types::{
-    CLIENT_QUEUE_CAPACITY, ClientCommand, ClientHello, ClientId, ClientMessage, Connection,
-    ConnectionError, DRIVER_INBOX_CAPACITY, DriverMessage, channel_paths, driver_inbox_path,
-};
-use crate::ipc::shmem::{Creator, Opener};
-use crate::ipc::spsc::{Consumer, Producer, Timeout};
-use minstant::Instant;
-
-/// Timeout for receiving Hello message during handshake.
-const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
-
-type DriverConnection = Connection<
-    Producer<DriverMessage, CLIENT_QUEUE_CAPACITY, Opener>,
-    Consumer<ClientMessage, CLIENT_QUEUE_CAPACITY, Opener>,
+type DriverConnection = ControlConnection<
+    Producer<DriverMessage, CONTROL_QUEUE_CAPACITY, Opener>,
+    Consumer<ClientMessage, CONTROL_QUEUE_CAPACITY, Opener>,
 >;
+
+enum DataEndpoint {
+    Inbound(Consumer<Frame, DATA_QUEUE_CAPACITY, Opener>),
+    Outbound(Producer<Frame, DATA_QUEUE_CAPACITY, Opener>),
+}
 
 struct Session {
     conn: DriverConnection,
     last_activity: Instant,
+    data_channels: HashMap<(u32, DataDirection), DataEndpoint>,
 }
 
 impl Session {
@@ -29,34 +34,52 @@ impl Session {
         Self {
             conn,
             last_activity: Instant::now(),
+            data_channels: HashMap::new(),
         }
+    }
+
+    fn close_data_channel(&mut self, req: DataChannelRequest) {
+        self.data_channels.remove(&(req.channel, req.dir));
     }
 }
 
-fn accept(client_id: ClientId) -> Result<DriverConnection, ConnectionError> {
-    let (client_tx_path, client_rx_path) = channel_paths(&client_id);
+fn handle_open_data(session: &mut Session, req: DataChannelRequest) -> Result<(), ConnectionError> {
+    let path = data_channel_path(&session.conn.id, req.channel, req.dir);
 
-    let tx = Producer::<DriverMessage, CLIENT_QUEUE_CAPACITY, Opener>::open(client_rx_path)?;
-    let rx = Consumer::<ClientMessage, CLIENT_QUEUE_CAPACITY, Opener>::open(client_tx_path)?;
-
-    // Parse: Expect Hello message
-    match rx
-        .pop_blocking(Timeout::Duration(HELLO_TIMEOUT))
-        .map(ClientHello::try_from)
-    {
-        Some(Ok(hello)) if hello.id == client_id => {}
-        Some(_) => return Err(ConnectionError::ProtocolViolation),
-        None => return Err(ConnectionError::Timeout),
+    match req.dir {
+        DataDirection::Tx => {
+            // Client created producer; driver opens consumer.
+            match Consumer::<Frame, DATA_QUEUE_CAPACITY, Opener>::open(path) {
+                Ok(rx) => {
+                    session
+                        .data_channels
+                        .insert((req.channel, req.dir), DataEndpoint::Inbound(rx));
+                    let _ = session.conn.tx.push(DriverMessage::DataChannelReady(req));
+                }
+                Err(err) => {
+                    eprintln!("Failed to open inbound data channel {:?}: {err}", req);
+                    let _ = session.conn.tx.push(DriverMessage::DataChannelError(req));
+                }
+            }
+        }
+        DataDirection::Rx => {
+            // Client created consumer; driver opens producer.
+            match Producer::<Frame, DATA_QUEUE_CAPACITY, Opener>::open(path) {
+                Ok(tx) => {
+                    session
+                        .data_channels
+                        .insert((req.channel, req.dir), DataEndpoint::Outbound(tx));
+                    let _ = session.conn.tx.push(DriverMessage::DataChannelReady(req));
+                }
+                Err(err) => {
+                    eprintln!("Failed to open outbound data channel {:?}: {err}", req);
+                    let _ = session.conn.tx.push(DriverMessage::DataChannelError(req));
+                }
+            }
+        }
     }
 
-    tx.push(DriverMessage::Welcome)
-        .map_err(|_| ConnectionError::QueueFull)?;
-
-    Ok(Connection {
-        id: client_id,
-        tx,
-        rx,
-    })
+    Ok(())
 }
 
 /// Manages client sessions and processes incoming connections.
@@ -92,7 +115,7 @@ impl Driver {
         let mut count = 0;
 
         while let Some(client_id) = self.inbox.pop() {
-            match accept(client_id) {
+            match driver_accept(client_id) {
                 Ok(conn) => {
                     self.sessions.insert(conn.id, Session::new(conn));
                     count += 1;
@@ -123,15 +146,29 @@ impl Driver {
                     session.last_activity = now;
                     match cmd {
                         ClientCommand::Disconnect => {
+                            // Client-initiated graceful disconnect.
+                            session.data_channels.clear();
                             disconnected.push(session.conn.id);
                             break;
                         }
                         ClientCommand::Heartbeat => {}
+                        ClientCommand::OpenDataChannel(req) => {
+                            if let Err(err) = handle_open_data(session, req) {
+                                eprintln!("Failed to open data channel {:?}: {err}", req);
+                            }
+                        }
+                        ClientCommand::CloseDataChannel(req) => {
+                            session.close_data_channel(req);
+                            let _ = session.conn.tx.push(DriverMessage::DataChannelClosed(req));
+                        }
                     }
                 }
             }
 
             if now.duration_since(session.last_activity) > timeout {
+                // Control heartbeat missed: treat as session death. Notify and drop.
+                let _ = session.conn.tx.push(DriverMessage::Shutdown);
+                session.data_channels.clear();
                 disconnected.push(session.conn.id);
             }
         }
