@@ -1,11 +1,10 @@
 //! Protocol types for client-driver control communication.
-//!
-//! Defines the message types and connection primitives used by [`Client`](super::client::Client)
-//! and [`Driver`](super::driver::Driver) to communicate over SPSC queues.
 
 use crate::SharedMemorySafe;
 use crate::ipc::shmem::{ShmError, ShmPath};
 use std::fmt;
+use std::time::Duration;
+use type_hash::TypeHash;
 
 /// Capacity of per-client control message queues (tx and rx).
 pub const CONTROL_QUEUE_CAPACITY: usize = 1024;
@@ -15,6 +14,12 @@ pub const DRIVER_INBOX_CAPACITY: usize = 256;
 
 /// Capacity of per-client data queues (tx or rx).
 pub const DATA_QUEUE_CAPACITY: usize = 1024;
+
+/// Timeout for receiving Hello/Welcome during handshake.
+pub const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Timeout for receiving DataChannelReady/Error during negotiation.
+pub const DATA_READY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Returns the well-known path for the driver's connection inbox.
 ///
@@ -45,13 +50,24 @@ pub fn control_channel_paths(id: &ClientId) -> (ShmPath, ShmPath) {
 }
 
 /// Generates shared memory path for a data channel.
+///
+/// # Panics
+///
+/// Never panics—generated paths are always valid.
 #[must_use]
-pub fn data_channel_path(id: &ClientId, channel: u32, dir: DataDirection) -> ShmPath {
-    let suffix = match dir {
-        DataDirection::Tx => "tx",
-        DataDirection::Rx => "rx",
-    };
-    let path = format!("/titan-data-{}-{}-{channel}-{suffix}", id.pid, id.nonce);
+pub fn data_tx_path(id: &ClientId, channel: ChannelId) -> ShmPath {
+    let path = format!("/titan-data-{}-{}-{}-tx", id.pid, id.nonce, channel.0);
+    ShmPath::new(path).expect("generated path is valid")
+}
+
+/// Generates shared memory path for a client's RX data channel.
+///
+/// # Panics
+///
+/// Never panics—generated paths are always valid.
+#[must_use]
+pub fn data_rx_path(id: &ClientId, channel: ChannelId) -> ShmPath {
+    let path = format!("/titan-data-{}-{}-{}-rx", id.pid, id.nonce, channel.0);
     ShmPath::new(path).expect("generated path is valid")
 }
 
@@ -85,24 +101,55 @@ pub struct ClientHello {
     pub id: ClientId,
 }
 
-/// Direction of a data channel.
+/// Application-defined channel identifier.
+// TODO we need to figure this out but this works for now
 #[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(C)]
-pub enum DataDirection {
-    /// Client outbound data
-    Tx,
-    /// Client inbound data
-    Rx,
+#[repr(transparent)]
+pub struct ChannelId(u32);
+
+impl ChannelId {
+    /// Creates a new channel identifier.
+    #[must_use]
+    pub const fn new(id: u32) -> Self {
+        Self(id)
+    }
 }
 
-/// Request describing a data channel (used for open/close/acks).
+impl From<u32> for ChannelId {
+    fn from(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+impl From<ChannelId> for u32 {
+    fn from(id: ChannelId) -> Self {
+        id.0
+    }
+}
+
+/// Unique identifier for a data message type
 #[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(C)]
-pub struct DataChannelRequest {
-    /// Application-defined channel identifier.
-    pub channel: u32,
-    /// Direction of data flow.
-    pub dir: DataDirection,
+#[repr(transparent)] // Newtype for u64
+pub struct TypeId(u64);
+
+impl TypeId {
+    /// Returns the structural type hash for `T`.
+    #[must_use]
+    pub fn of<T: TypeHash>() -> Self {
+        Self(T::type_hash())
+    }
+}
+
+impl From<u64> for TypeId {
+    fn from(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+impl From<TypeId> for u64 {
+    fn from(id: TypeId) -> Self {
+        id.0
+    }
 }
 
 /// Commands sent from client to driver during an active session.
@@ -113,10 +160,12 @@ pub enum ClientCommand {
     Heartbeat,
     /// Graceful disconnect request.
     Disconnect,
-    /// Request a new data channel.
-    OpenDataChannel(DataChannelRequest),
-    /// Close an existing data channel.
-    CloseDataChannel(DataChannelRequest),
+    /// Request a new transmit channel (client -> driver).
+    OpenTx { channel: ChannelId, type_id: TypeId },
+    /// Request a new receive channel (driver -> client).
+    OpenRx { channel: ChannelId, type_id: TypeId },
+    /// Close an existing channel.
+    CloseChannel(ChannelId),
 }
 
 /// Messages sent from client to driver.
@@ -162,11 +211,11 @@ pub enum DriverMessage {
     /// Driver is shutting down, client should disconnect.
     Shutdown,
     /// Data channel is ready to use.
-    DataChannelReady(DataChannelRequest),
+    ChannelReady(ChannelId),
     /// Data channel failed to open.
-    DataChannelError(DataChannelRequest),
+    ChannelError(ChannelId),
     /// Data channel closed/acknowledged.
-    DataChannelClosed(DataChannelRequest),
+    ChannelClosed(ChannelId),
 }
 
 /// Errors that can occur during connection establishment or communication.

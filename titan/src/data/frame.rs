@@ -1,28 +1,74 @@
 //! Frame-based wire format for typed messages.
 
 use serde::{Deserialize, Serialize};
+use type_hash::TypeHash;
 
 use crate::SharedMemorySafe;
 
 /// Default payload capacity for frames.
 pub const DEFAULT_FRAME_CAP: usize = 256;
 
+/// Fixed-size container for a serialized message.
+///
+/// Frames are the wire format for data channels. Messages are serialized into
+/// the payload using [`postcard`], with the length stored separately.
+///
+/// The frame is cache-line aligned (64 bytes) for optimal SPSC queue performance.
 #[derive(SharedMemorySafe, Debug, Clone, Copy)]
 #[repr(C)]
 #[repr(align(64))]
 pub struct Frame<const N: usize = DEFAULT_FRAME_CAP> {
-    /// Bytes used inside `payload`.
-    pub len: u16,
-    /// Serialized message bytes.
-    pub payload: [u8; N],
+    len: u16,
+    payload: [u8; N],
 }
 
+impl<const N: usize> Frame<N> {
+    /// Creates a new empty frame.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            len: 0,
+            payload: [0; N],
+        }
+    }
+
+    /// Returns the length of the valid payload.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Returns true if the frame is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the valid payload slice.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload[..self.len as usize]
+    }
+}
+
+impl<const N: usize> Default for Frame<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Errors from frame encoding or decoding.
 #[derive(Debug)]
 pub enum FrameError {
-    /// Serialization failed or out of capacity.
+    /// Serialization or deserialization failed.
     Serialize(postcard::Error),
-    /// `len` exceeds the frame payload.
-    LenOutOfBounds { len: usize, cap: usize }, // this will be removed later on when we support chunking
+    /// Message length exceeds frame capacity.
+    LenOutOfBounds {
+        /// Actual message length.
+        len: usize,
+        /// Frame capacity.
+        cap: usize,
+    },
 }
 
 impl From<postcard::Error> for FrameError {
@@ -31,25 +77,48 @@ impl From<postcard::Error> for FrameError {
     }
 }
 
-/// Marker trait for types that can be serialized into a [`Frame`].
+/// Trait for types that can be serialized into a [`Frame`].
 ///
-/// Automatically implemented for all `Serialize + Deserialize` types.
-pub trait Wire: Serialize + for<'de> Deserialize<'de> {}
-impl<T> Wire for T where T: Serialize + for<'de> Deserialize<'de> {}
+/// Requires `Serialize + Deserialize + TypeHash`. The type ID is automatically
+/// computed as a structural hash of the type's definition, ensuring that types
+/// with identical structure (same fields, same types, same names) produce
+/// the same ID across compilations and machines.
+pub trait Wire: Serialize + for<'de> Deserialize<'de> + TypeHash {
+    /// Returns a unique identifier computed from the type's structure.
+    ///
+    /// This hash is stable across compilations - same type definition
+    /// produces the same ID. Used to ensure type safety across process
+    /// and network boundaries.
+    #[must_use]
+    fn type_id() -> u64 {
+        Self::type_hash()
+    }
+}
+
+/// Blanket implementation for all types that satisfy the bounds.
+impl<T> Wire for T where T: Serialize + for<'de> Deserialize<'de> + TypeHash {}
 
 impl<const N: usize> Frame<N> {
     /// Serialize `msg` into this frame's payload and set headers.
+    ///
+    /// # Errors
+    /// - [`FrameError::Serialize`] if serialization fails
+    /// - [`FrameError::LenOutOfBounds`] if the encoded payload exceeds the frame capacity or `u16::MAX`
     pub fn encode<T: Wire>(&mut self, msg: &T) -> Result<(), FrameError> {
         let used = postcard::to_slice(msg, &mut self.payload)?;
         let len = used.len();
         if len > N {
             return Err(FrameError::LenOutOfBounds { len, cap: N });
         }
-        self.len = len as u16;
+        self.len = u16::try_from(len).map_err(|_| FrameError::LenOutOfBounds { len, cap: N })?;
         Ok(())
     }
 
     /// Deserialize a message from this frame.
+    ///
+    /// # Errors
+    /// - [`FrameError::LenOutOfBounds`] if the stored length exceeds the frame capacity
+    /// - [`FrameError::Serialize`] if deserialization fails
     pub fn decode<T: Wire>(&self) -> Result<T, FrameError> {
         if usize::from(self.len) > N {
             return Err(FrameError::LenOutOfBounds {
@@ -66,10 +135,15 @@ impl<const N: usize> Frame<N> {
 mod tests {
     use super::*;
 
-    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    #[derive(Serialize, Deserialize, TypeHash, Debug, PartialEq)]
     struct Sample {
         a: u32,
         b: u8,
+    }
+
+    #[derive(Serialize, Deserialize, TypeHash, Debug, PartialEq)]
+    struct Large {
+        data: Vec<u8>,
     }
 
     #[test]
@@ -78,13 +152,104 @@ mod tests {
             a: 0xdead_beef,
             b: 7,
         };
-        let mut frame = Frame::<64> {
-            len: 0,
-            payload: [0u8; 64],
-        };
+        let mut frame = Frame::<64>::new();
+        frame.encode(&msg).unwrap();
+        let decoded: Sample = frame.decode().unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn empty_frame() {
+        let frame = Frame::<64>::new();
+        assert!(frame.is_empty());
+        assert_eq!(frame.len(), 0);
+        assert!(frame.payload().is_empty());
+    }
+
+    #[test]
+    fn frame_default() {
+        let frame: Frame<64> = Frame::default();
+        assert!(frame.is_empty());
+    }
+
+    #[test]
+    fn encode_updates_len() {
+        let msg = Sample { a: 1, b: 2 };
+        let mut frame = Frame::<64>::new();
+        assert!(frame.is_empty());
 
         frame.encode(&msg).unwrap();
-        let decoded = frame.decode::<Sample>().unwrap();
+        assert!(!frame.is_empty());
+        assert!(frame.len() > 0);
+        assert_eq!(frame.payload().len(), frame.len());
+    }
+
+    #[test]
+    fn encode_overflow_capacity() {
+        let msg = Large {
+            data: vec![0xAB; 128],
+        };
+        let mut frame = Frame::<32>::new(); // Too small for Large
+
+        let result = frame.encode(&msg);
+        assert!(result.is_err());
+        match result {
+            Err(FrameError::Serialize(_)) => {} // postcard fails during serialization
+            Err(FrameError::LenOutOfBounds { .. }) => {}
+            _ => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn decode_corrupted_len() {
+        // Manually create a frame with invalid len > capacity
+        let mut frame = Frame::<64>::new();
+        frame.len = 100; // Invalid: exceeds capacity of 64
+
+        let result: Result<Sample, _> = frame.decode();
+        assert!(matches!(
+            result,
+            Err(FrameError::LenOutOfBounds { len: 100, cap: 64 })
+        ));
+    }
+
+    #[test]
+    fn decode_empty_frame_fails() {
+        let frame = Frame::<64>::new();
+        // Decoding empty frame should fail (no valid postcard data)
+        let result: Result<Sample, _> = frame.decode();
+        assert!(matches!(result, Err(FrameError::Serialize(_))));
+    }
+
+    #[test]
+    fn roundtrip_at_exact_capacity() {
+        // Create a message that fits exactly
+        #[derive(Serialize, Deserialize, TypeHash, Debug, PartialEq)]
+        struct Small(u8);
+
+        let msg = Small(42);
+        let mut frame = Frame::<8>::new();
+        frame.encode(&msg).unwrap();
+        let decoded: Small = frame.decode().unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn multiple_encodes_overwrite() {
+        let mut frame = Frame::<64>::new();
+
+        let msg1 = Sample { a: 1, b: 1 };
+        frame.encode(&msg1).unwrap();
+        let len1 = frame.len();
+
+        let msg2 = Sample { a: 999, b: 255 };
+        frame.encode(&msg2).unwrap();
+
+        // Second encode should overwrite
+        let decoded: Sample = frame.decode().unwrap();
+        assert_eq!(decoded, msg2);
+        // Length might differ if values serialize differently
+        assert!(frame.len() > 0);
+        let _ = len1; // Acknowledge we captured it
     }
 }

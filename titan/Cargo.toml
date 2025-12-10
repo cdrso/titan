@@ -11,8 +11,15 @@ rustix.workspace = true
 titan-derive = { path = "../titan-derive" }
 serde = { version = "1.0.228", features = ["derive"] }
 postcard = "1.0.3"
+type_hash = "0.3.0"
+
+# networking
+#mio = "1.1.1"
+#capsule = "0.1.5"
+#xsk-rs = "0.8.0"
 
 [dev-dependencies]
+serial_test = "3.2.0"
 trybuild.workspace = true
 
 [[bin]]

@@ -2,9 +2,9 @@
 
 use crate::control::handshake::driver_accept;
 use crate::control::types::{
-    CONTROL_QUEUE_CAPACITY, ClientCommand, ClientId, ClientMessage, ConnectionError,
-    ControlConnection, DATA_QUEUE_CAPACITY, DRIVER_INBOX_CAPACITY, DataChannelRequest,
-    DataDirection, DriverMessage, data_channel_path, driver_inbox_path,
+    CONTROL_QUEUE_CAPACITY, ChannelId, ClientCommand, ClientId, ClientMessage, ConnectionError,
+    ControlConnection, DATA_QUEUE_CAPACITY, DRIVER_INBOX_CAPACITY, DriverMessage, data_rx_path,
+    data_tx_path, driver_inbox_path,
 };
 use crate::data::Frame;
 use crate::ipc::shmem::{Creator, Opener};
@@ -23,10 +23,107 @@ enum DataEndpoint {
     Outbound(Producer<Frame, DATA_QUEUE_CAPACITY, Opener>),
 }
 
+struct DataChannels {
+    channels: HashMap<ChannelId, DataEndpoint>,
+}
+
+impl DataChannels {
+    fn new() -> Self {
+        Self {
+            channels: HashMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.channels.clear();
+    }
+
+    fn close(&mut self, channel: ChannelId) -> Option<DataEndpoint> {
+        self.channels.remove(&channel)
+    }
+
+    fn handle_open_tx(
+        &mut self,
+        conn: &DriverConnection,
+        channel: ChannelId,
+    ) -> Result<(), ConnectionError> {
+        if self.channels.contains_key(&channel) {
+            conn.tx
+                .push(DriverMessage::ChannelError(channel))
+                .map_err(|_| ConnectionError::QueueFull)?;
+            return Err(ConnectionError::ProtocolViolation);
+        }
+
+        let path = data_tx_path(&conn.id, channel);
+        match Consumer::<Frame, DATA_QUEUE_CAPACITY, Opener>::open(path) {
+            Ok(rx) => {
+                self.channels.insert(channel, DataEndpoint::Inbound(rx));
+                conn.tx
+                    .push(DriverMessage::ChannelReady(channel))
+                    .map_err(|_| ConnectionError::QueueFull)?;
+                Ok(())
+            }
+            Err(err) => {
+                conn.tx
+                    .push(DriverMessage::ChannelError(channel))
+                    .map_err(|_| ConnectionError::QueueFull)?;
+                Err(ConnectionError::from(err))
+            }
+        }
+    }
+
+    fn handle_open_rx(
+        &mut self,
+        conn: &DriverConnection,
+        channel: ChannelId,
+    ) -> Result<(), ConnectionError> {
+        if self.channels.contains_key(&channel) {
+            conn.tx
+                .push(DriverMessage::ChannelError(channel))
+                .map_err(|_| ConnectionError::QueueFull)?;
+            return Err(ConnectionError::ProtocolViolation);
+        }
+
+        let path = data_rx_path(&conn.id, channel);
+        match Producer::<Frame, DATA_QUEUE_CAPACITY, Opener>::open(path) {
+            Ok(tx) => {
+                self.channels.insert(channel, DataEndpoint::Outbound(tx));
+                conn.tx
+                    .push(DriverMessage::ChannelReady(channel))
+                    .map_err(|_| ConnectionError::QueueFull)?;
+                Ok(())
+            }
+            Err(err) => {
+                conn.tx
+                    .push(DriverMessage::ChannelError(channel))
+                    .map_err(|_| ConnectionError::QueueFull)?;
+                Err(ConnectionError::from(err))
+            }
+        }
+    }
+
+    fn inbound(&self, channel: ChannelId) -> Option<&Consumer<Frame, DATA_QUEUE_CAPACITY, Opener>> {
+        match self.channels.get(&channel) {
+            Some(DataEndpoint::Inbound(rx)) => Some(rx),
+            _ => None,
+        }
+    }
+
+    fn outbound(
+        &self,
+        channel: ChannelId,
+    ) -> Option<&Producer<Frame, DATA_QUEUE_CAPACITY, Opener>> {
+        match self.channels.get(&channel) {
+            Some(DataEndpoint::Outbound(tx)) => Some(tx),
+            _ => None,
+        }
+    }
+}
+
 struct Session {
     conn: DriverConnection,
     last_activity: Instant,
-    data_channels: HashMap<(u32, DataDirection), DataEndpoint>,
+    data_channels: DataChannels,
 }
 
 impl Session {
@@ -34,52 +131,18 @@ impl Session {
         Self {
             conn,
             last_activity: Instant::now(),
-            data_channels: HashMap::new(),
+            data_channels: DataChannels::new(),
         }
     }
 
-    fn close_data_channel(&mut self, req: DataChannelRequest) {
-        self.data_channels.remove(&(req.channel, req.dir));
-    }
-}
-
-fn handle_open_data(session: &mut Session, req: DataChannelRequest) -> Result<(), ConnectionError> {
-    let path = data_channel_path(&session.conn.id, req.channel, req.dir);
-
-    match req.dir {
-        DataDirection::Tx => {
-            // Client created producer; driver opens consumer.
-            match Consumer::<Frame, DATA_QUEUE_CAPACITY, Opener>::open(path) {
-                Ok(rx) => {
-                    session
-                        .data_channels
-                        .insert((req.channel, req.dir), DataEndpoint::Inbound(rx));
-                    let _ = session.conn.tx.push(DriverMessage::DataChannelReady(req));
-                }
-                Err(err) => {
-                    eprintln!("Failed to open inbound data channel {:?}: {err}", req);
-                    let _ = session.conn.tx.push(DriverMessage::DataChannelError(req));
-                }
-            }
-        }
-        DataDirection::Rx => {
-            // Client created consumer; driver opens producer.
-            match Producer::<Frame, DATA_QUEUE_CAPACITY, Opener>::open(path) {
-                Ok(tx) => {
-                    session
-                        .data_channels
-                        .insert((req.channel, req.dir), DataEndpoint::Outbound(tx));
-                    let _ = session.conn.tx.push(DriverMessage::DataChannelReady(req));
-                }
-                Err(err) => {
-                    eprintln!("Failed to open outbound data channel {:?}: {err}", req);
-                    let _ = session.conn.tx.push(DriverMessage::DataChannelError(req));
-                }
+    fn close_data_channel(&mut self, channel: ChannelId) {
+        if let Some(endpoint) = self.data_channels.close(channel) {
+            match endpoint {
+                DataEndpoint::Inbound(rx) => drop(rx),
+                DataEndpoint::Outbound(tx) => drop(tx),
             }
         }
     }
-
-    Ok(())
 }
 
 /// Manages client sessions and processes incoming connections.
@@ -115,14 +178,9 @@ impl Driver {
         let mut count = 0;
 
         while let Some(client_id) = self.inbox.pop() {
-            match driver_accept(client_id) {
-                Ok(conn) => {
-                    self.sessions.insert(conn.id, Session::new(conn));
-                    count += 1;
-                }
-                Err(e) => {
-                    eprintln!("Failed to accept client {client_id:?}: {e}");
-                }
+            if let Ok(conn) = driver_accept(client_id) {
+                self.sessions.insert(conn.id, Session::new(conn));
+                count += 1;
             }
         }
 
@@ -152,14 +210,30 @@ impl Driver {
                             break;
                         }
                         ClientCommand::Heartbeat => {}
-                        ClientCommand::OpenDataChannel(req) => {
-                            if let Err(err) = handle_open_data(session, req) {
-                                eprintln!("Failed to open data channel {:?}: {err}", req);
+                        ClientCommand::OpenTx { channel, .. } => {
+                            if let Err(err) =
+                                session.data_channels.handle_open_tx(&session.conn, channel)
+                            {
+                                let _ = err;
                             }
                         }
-                        ClientCommand::CloseDataChannel(req) => {
-                            session.close_data_channel(req);
-                            let _ = session.conn.tx.push(DriverMessage::DataChannelClosed(req));
+                        ClientCommand::OpenRx { channel, .. } => {
+                            if let Err(err) =
+                                session.data_channels.handle_open_rx(&session.conn, channel)
+                            {
+                                let _ = err;
+                            }
+                        }
+                        ClientCommand::CloseChannel(channel) => {
+                            session.close_data_channel(channel);
+                            if let Err(err) = session
+                                .conn
+                                .tx
+                                .push(DriverMessage::ChannelClosed(channel))
+                                .map_err(|_| ConnectionError::QueueFull)
+                            {
+                                let _ = err;
+                            }
                         }
                     }
                 }
@@ -200,5 +274,263 @@ impl Driver {
     /// Broadcasts a shutdown message and drops all sessions.
     pub fn shutdown(self) {
         let _ = self.broadcast(DriverMessage::Shutdown);
+    }
+
+    /// Returns a reference to a client's inbound data channel.
+    ///
+    /// Inbound channels carry data from client to driver (client TX → driver RX).
+    /// Used by the network I/O loop to read messages from clients and send over UDP.
+    #[must_use]
+    pub fn inbound(
+        &self,
+        client: ClientId,
+        channel: ChannelId,
+    ) -> Option<&Consumer<Frame, DATA_QUEUE_CAPACITY, Opener>> {
+        self.sessions
+            .get(&client)
+            .and_then(|s| s.data_channels.inbound(channel))
+    }
+
+    /// Returns a reference to a client's outbound data channel.
+    ///
+    /// Outbound channels carry data from driver to client (driver TX → client RX).
+    /// Used by the network I/O loop to write received UDP packets to clients.
+    #[must_use]
+    pub fn outbound(
+        &self,
+        client: ClientId,
+        channel: ChannelId,
+    ) -> Option<&Producer<Frame, DATA_QUEUE_CAPACITY, Opener>> {
+        self.sessions
+            .get(&client)
+            .and_then(|s| s.data_channels.outbound(channel))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::Client;
+    use crate::ipc::spsc::Timeout;
+    use serde::{Deserialize, Serialize};
+    use serial_test::serial;
+    use std::thread;
+    use std::time::Duration;
+    use type_hash::TypeHash;
+
+    fn with_clean_inbox<F, R>(f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let path = driver_inbox_path();
+        let _ = rustix::shm::unlink(path.as_ref());
+        f()
+    }
+
+    #[test]
+    #[serial]
+    fn driver_new_creates_inbox() {
+        with_clean_inbox(|| {
+            let driver = Driver::new().unwrap();
+            assert_eq!(driver.connection_count(), 0);
+            drop(driver);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn driver_new_fails_if_already_running() {
+        with_clean_inbox(|| {
+            let driver1 = Driver::new().unwrap();
+            let result = Driver::new();
+            assert!(matches!(result, Err(ConnectionError::Shm(_))));
+            drop(driver1);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn driver_accept_pending_empty() {
+        with_clean_inbox(|| {
+            let mut driver = Driver::new().unwrap();
+            let accepted = driver.accept_pending();
+            assert_eq!(accepted, 0);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn driver_broadcast_no_clients() {
+        with_clean_inbox(|| {
+            let driver = Driver::new().unwrap();
+            let sent = driver.broadcast(DriverMessage::Shutdown);
+            assert_eq!(sent, 0);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn driver_tick_empty_sessions() {
+        with_clean_inbox(|| {
+            let mut driver = Driver::new().unwrap();
+            let disconnected = driver.tick(Duration::from_secs(10));
+            assert!(disconnected.is_empty());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn driver_inbound_outbound_no_session() {
+        with_clean_inbox(|| {
+            let driver = Driver::new().unwrap();
+            let fake_id = ClientId::generate();
+
+            assert!(driver.inbound(fake_id, ChannelId::new(1)).is_none());
+            assert!(driver.outbound(fake_id, ChannelId::new(1)).is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn driver_data_channel_access() {
+        with_clean_inbox(|| {
+            #[derive(Serialize, Deserialize, TypeHash, Debug, PartialEq)]
+            struct TestMsg(u32);
+
+            use std::sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            };
+
+            let data_sent = Arc::new(AtomicBool::new(false));
+            let data_sent_clone = Arc::clone(&data_sent);
+
+            let driver_thread = thread::spawn(move || {
+                let mut driver = Driver::new().unwrap();
+
+                // Wait for client to connect
+                for _ in 0..20 {
+                    if driver.accept_pending() > 0 {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+
+                let client_id = driver.sessions.keys().next().copied();
+
+                // Process data channel open and wait for data to be sent
+                for _ in 0..50 {
+                    driver.tick(Duration::from_secs(10));
+                    if data_sent_clone.load(Ordering::Acquire) {
+                        // Give a little more time after data is sent
+                        thread::sleep(Duration::from_millis(20));
+                        driver.tick(Duration::from_secs(10));
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+
+                // Check inbound channel exists and read data
+                if let Some(id) = client_id {
+                    let inbound = driver.inbound(id, ChannelId::new(1));
+                    assert!(inbound.is_some(), "inbound channel should exist");
+
+                    if let Some(consumer) = inbound {
+                        // Try a few times to read
+                        for _ in 0..10 {
+                            if let Some(frame) = consumer.pop() {
+                                let msg: TestMsg = frame.decode().unwrap();
+                                assert_eq!(msg, TestMsg(999));
+                                return driver;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        panic!("Failed to read message from inbound channel");
+                    }
+                }
+
+                driver
+            });
+
+            thread::sleep(Duration::from_millis(10));
+            let inbox_path = driver_inbox_path();
+            let client =
+                Client::connect(inbox_path, Timeout::Duration(Duration::from_secs(1))).unwrap();
+
+            // Open TX channel
+            let tx = client
+                .open_data_tx::<TestMsg>(
+                    ChannelId::new(1),
+                    Timeout::Duration(Duration::from_secs(1)),
+                )
+                .unwrap();
+
+            // Send data
+            tx.send(&TestMsg(999)).unwrap();
+            data_sent.store(true, Ordering::Release);
+
+            // Wait for driver to finish
+            let _ = driver_thread.join().unwrap();
+
+            client.disconnect();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn driver_shutdown() {
+        with_clean_inbox(|| {
+            let driver_thread = thread::spawn(|| {
+                let mut driver = Driver::new().unwrap();
+                thread::sleep(Duration::from_millis(50));
+                driver.accept_pending();
+                driver.shutdown();
+            });
+
+            thread::sleep(Duration::from_millis(10));
+            let inbox_path = driver_inbox_path();
+            let client =
+                Client::connect(inbox_path, Timeout::Duration(Duration::from_secs(1))).unwrap();
+
+            // Wait for shutdown message
+            thread::sleep(Duration::from_millis(100));
+            let msg = client.recv();
+
+            // Client should receive shutdown
+            assert!(matches!(msg, Some(DriverMessage::Shutdown)));
+
+            driver_thread.join().unwrap();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn driver_handles_client_disconnect() {
+        with_clean_inbox(|| {
+            let driver_thread = thread::spawn(|| {
+                let mut driver = Driver::new().unwrap();
+                thread::sleep(Duration::from_millis(50));
+                let accepted = driver.accept_pending();
+                assert_eq!(accepted, 1);
+
+                // Wait for disconnect command
+                thread::sleep(Duration::from_millis(100));
+                let disconnected = driver.tick(Duration::from_secs(10));
+
+                (driver.connection_count(), disconnected.len())
+            });
+
+            thread::sleep(Duration::from_millis(10));
+            let inbox_path = driver_inbox_path();
+            let client =
+                Client::connect(inbox_path, Timeout::Duration(Duration::from_secs(1))).unwrap();
+
+            // Disconnect
+            client.disconnect();
+
+            let (count, disconnected) = driver_thread.join().unwrap();
+            assert_eq!(count, 0);
+            assert_eq!(disconnected, 1);
+        });
     }
 }

@@ -1,3 +1,5 @@
+//! Client-driver control protocol over shared memory.
+
 pub mod client;
 pub mod driver;
 pub mod handshake;
