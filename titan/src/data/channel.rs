@@ -135,7 +135,6 @@ impl<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode>
             .pop_blocking(timeout)
             .map(|frame| frame.decode().map_err(TypedChannelError::Frame))
     }
-
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 //! Protocol types for client-driver control communication.
 
 use crate::SharedMemorySafe;
-use crate::ipc::shmem::{ShmError, ShmPath};
+use crate::ipc::shmem::{Creator, Opener, ShmError, ShmMode, ShmPath};
+use crate::ipc::spsc::{Consumer, Producer};
 use std::fmt;
 use std::time::Duration;
 use type_hash::TypeHash;
@@ -17,9 +18,6 @@ pub const DATA_QUEUE_CAPACITY: usize = 1024;
 
 /// Timeout for receiving Hello/Welcome during handshake.
 pub const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Timeout for receiving DataChannelReady/Error during negotiation.
-pub const DATA_READY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Returns the well-known path for the driver's connection inbox.
 ///
@@ -140,12 +138,6 @@ impl TypeId {
     }
 }
 
-impl From<u64> for TypeId {
-    fn from(id: u64) -> Self {
-        Self(id)
-    }
-}
-
 impl From<TypeId> for u64 {
     fn from(id: TypeId) -> Self {
         id.0
@@ -252,13 +244,37 @@ impl fmt::Display for ConnectionError {
 }
 
 /// A bidirectional control connection between client and driver.
-pub struct ControlConnection<Tx, Rx> {
+pub struct ControlConnection<Role: ConnectionRole> {
     /// The client's unique identifier.
     pub id: ClientId,
     /// Transmit channel.
-    pub tx: Tx,
+    pub tx: Producer<Role::TxMessage, CONTROL_QUEUE_CAPACITY, Role::Mode>,
     /// Receive channel.
-    pub rx: Rx,
+    pub rx: Consumer<Role::RxMessage, CONTROL_QUEUE_CAPACITY, Role::Mode>,
+}
+
+/// Marker for a client-side control connection.
+pub struct ClientRole;
+/// Marker for a driver-side control connection.
+pub struct DriverRole;
+
+/// Strategy trait mapping a role to its message types and shared memory mode.
+pub trait ConnectionRole {
+    type TxMessage: SharedMemorySafe;
+    type RxMessage: SharedMemorySafe;
+    type Mode: ShmMode;
+}
+
+impl ConnectionRole for ClientRole {
+    type TxMessage = ClientMessage;
+    type RxMessage = DriverMessage;
+    type Mode = Creator;
+}
+
+impl ConnectionRole for DriverRole {
+    type TxMessage = DriverMessage;
+    type RxMessage = ClientMessage;
+    type Mode = Opener;
 }
 
 #[cfg(test)]

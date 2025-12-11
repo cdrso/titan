@@ -1,21 +1,15 @@
 //! Handshake helpers for control connections (Hello/Welcome).
 
 use crate::control::types::{
-    CONTROL_QUEUE_CAPACITY, ClientHello, ClientId, ClientMessage, ConnectionError,
-    ControlConnection, DRIVER_INBOX_CAPACITY, DriverMessage, HELLO_TIMEOUT, control_channel_paths,
+    CONTROL_QUEUE_CAPACITY, ClientHello, ClientId, ClientMessage, ClientRole, ConnectionError,
+    ControlConnection, DRIVER_INBOX_CAPACITY, DriverMessage, DriverRole, HELLO_TIMEOUT,
+    control_channel_paths,
 };
-use crate::ipc::shmem::{Creator, Opener, ShmPath};
+use crate::ipc::shmem::{Opener, ShmPath};
 use crate::ipc::spsc::{Consumer, Producer, Timeout};
 
-type ClientHandshakeConn = ControlConnection<
-    Producer<ClientMessage, CONTROL_QUEUE_CAPACITY, Creator>,
-    Consumer<DriverMessage, CONTROL_QUEUE_CAPACITY, Creator>,
->;
-
-type DriverHandshakeConn = ControlConnection<
-    Producer<DriverMessage, CONTROL_QUEUE_CAPACITY, Opener>,
-    Consumer<ClientMessage, CONTROL_QUEUE_CAPACITY, Opener>,
->;
+type ClientConn = ControlConnection<ClientRole>;
+type DriverConn = ControlConnection<DriverRole>;
 
 /// Client-side handshake: create control queues, send Hello, await Welcome.
 ///
@@ -24,10 +18,10 @@ type DriverHandshakeConn = ControlConnection<
 /// - [`ConnectionError::Timeout`] if Welcome is not received before the deadline
 /// - [`ConnectionError::ProtocolViolation`] if the driver responds with an unexpected message
 /// - [`ConnectionError::Shm`] for shared memory creation/open failures
-pub fn client_handshake(
+pub fn client_connect(
     driver_inbox_path: ShmPath,
     timeout: Timeout,
-) -> Result<ClientHandshakeConn, ConnectionError> {
+) -> Result<ClientConn, ConnectionError> {
     let id = ClientId::generate();
     let (tx_path, rx_path) = control_channel_paths(&id);
 
@@ -57,7 +51,7 @@ pub fn client_handshake(
 /// - [`ConnectionError::ProtocolViolation`] if the Hello contains the wrong ID or message type
 /// - [`ConnectionError::QueueFull`] if the Welcome cannot be enqueued
 /// - [`ConnectionError::Shm`] for shared memory open failures
-pub fn driver_accept(client_id: ClientId) -> Result<DriverHandshakeConn, ConnectionError> {
+pub fn driver_accept(client_id: ClientId) -> Result<DriverConn, ConnectionError> {
     let (client_tx_path, client_rx_path) = control_channel_paths(&client_id);
 
     let tx = Producer::<DriverMessage, CONTROL_QUEUE_CAPACITY, Opener>::open(client_rx_path)?;
@@ -111,7 +105,7 @@ mod tests {
                     .unwrap();
 
             let client_thread = thread::spawn(move || {
-                client_handshake(inbox_path, Timeout::Duration(Duration::from_secs(1)))
+                client_connect(inbox_path, Timeout::Duration(Duration::from_secs(1)))
             });
 
             // Driver accepts
@@ -135,7 +129,7 @@ mod tests {
                 Consumer::<ClientId, DRIVER_INBOX_CAPACITY, Creator>::create(inbox_path.clone())
                     .unwrap();
 
-            let result = client_handshake(inbox_path, Timeout::Duration(Duration::from_millis(50)));
+            let result = client_connect(inbox_path, Timeout::Duration(Duration::from_millis(50)));
 
             assert!(matches!(result, Err(ConnectionError::Timeout)));
         });
@@ -146,7 +140,7 @@ mod tests {
     fn handshake_no_inbox_fails() {
         with_clean_inbox(|inbox_path| {
             // Don't create inbox - should fail to open
-            let result = client_handshake(inbox_path, Timeout::Duration(Duration::from_millis(50)));
+            let result = client_connect(inbox_path, Timeout::Duration(Duration::from_millis(50)));
 
             assert!(matches!(result, Err(ConnectionError::Shm(_))));
         });
@@ -178,7 +172,7 @@ mod tests {
                     .unwrap();
 
             let client_thread = thread::spawn(move || {
-                client_handshake(inbox_path, Timeout::Duration(Duration::from_secs(1)))
+                client_connect(inbox_path, Timeout::Duration(Duration::from_secs(1)))
             });
 
             thread::sleep(Duration::from_millis(10));

@@ -2,9 +2,9 @@
 
 use crate::control::handshake::driver_accept;
 use crate::control::types::{
-    CONTROL_QUEUE_CAPACITY, ChannelId, ClientCommand, ClientId, ClientMessage, ConnectionError,
-    ControlConnection, DATA_QUEUE_CAPACITY, DRIVER_INBOX_CAPACITY, DriverMessage, data_rx_path,
-    data_tx_path, driver_inbox_path,
+    ChannelId, ClientCommand, ClientId, ConnectionError, ControlConnection, DATA_QUEUE_CAPACITY,
+    DRIVER_INBOX_CAPACITY, DriverMessage, DriverRole, data_rx_path, data_tx_path,
+    driver_inbox_path,
 };
 use crate::data::Frame;
 use crate::ipc::shmem::{Creator, Opener};
@@ -13,13 +13,13 @@ use minstant::Instant;
 use std::collections::HashMap;
 use std::time::Duration;
 
-type DriverConnection = ControlConnection<
-    Producer<DriverMessage, CONTROL_QUEUE_CAPACITY, Opener>,
-    Consumer<ClientMessage, CONTROL_QUEUE_CAPACITY, Opener>,
->;
+type DriverConnection = ControlConnection<DriverRole>;
 
-enum DataEndpoint {
+/// A data channel endpoint on the driver side.
+pub enum DataEndpoint {
+    /// Data flowing from client to driver (client TX → driver RX).
     Inbound(Consumer<Frame, DATA_QUEUE_CAPACITY, Opener>),
+    /// Data flowing from driver to client (driver TX → client RX).
     Outbound(Producer<Frame, DATA_QUEUE_CAPACITY, Opener>),
 }
 
@@ -42,6 +42,7 @@ impl DataChannels {
         self.channels.remove(&channel)
     }
 
+    // TODO we need to be more explicit about the error when an existing id is passed
     fn handle_open_tx(
         &mut self,
         conn: &DriverConnection,
@@ -72,6 +73,7 @@ impl DataChannels {
         }
     }
 
+    // TODO we need to be more explicit about the error when an existing id is passed
     fn handle_open_rx(
         &mut self,
         conn: &DriverConnection,
@@ -102,21 +104,8 @@ impl DataChannels {
         }
     }
 
-    fn inbound(&self, channel: ChannelId) -> Option<&Consumer<Frame, DATA_QUEUE_CAPACITY, Opener>> {
-        match self.channels.get(&channel) {
-            Some(DataEndpoint::Inbound(rx)) => Some(rx),
-            _ => None,
-        }
-    }
-
-    fn outbound(
-        &self,
-        channel: ChannelId,
-    ) -> Option<&Producer<Frame, DATA_QUEUE_CAPACITY, Opener>> {
-        match self.channels.get(&channel) {
-            Some(DataEndpoint::Outbound(tx)) => Some(tx),
-            _ => None,
-        }
+    fn get(&self, channel: ChannelId) -> Option<&DataEndpoint> {
+        self.channels.get(&channel)
     }
 }
 
@@ -276,34 +265,16 @@ impl Driver {
         let _ = self.broadcast(DriverMessage::Shutdown);
     }
 
-    /// Returns a reference to a client's inbound data channel.
+    /// Returns a reference to a client's data channel.
     ///
-    /// Inbound channels carry data from client to driver (client TX → driver RX).
-    /// Used by the network I/O loop to read messages from clients and send over UDP.
+    /// Returns `None` if the client or channel doesn't exist.
+    /// Returns `Some(DataEndpoint::Inbound)` or `Some(DataEndpoint::Outbound)`
+    /// depending on the channel direction.
     #[must_use]
-    pub fn inbound(
-        &self,
-        client: ClientId,
-        channel: ChannelId,
-    ) -> Option<&Consumer<Frame, DATA_QUEUE_CAPACITY, Opener>> {
+    pub fn channel(&self, client: ClientId, channel: ChannelId) -> Option<&DataEndpoint> {
         self.sessions
             .get(&client)
-            .and_then(|s| s.data_channels.inbound(channel))
-    }
-
-    /// Returns a reference to a client's outbound data channel.
-    ///
-    /// Outbound channels carry data from driver to client (driver TX → client RX).
-    /// Used by the network I/O loop to write received UDP packets to clients.
-    #[must_use]
-    pub fn outbound(
-        &self,
-        client: ClientId,
-        channel: ChannelId,
-    ) -> Option<&Producer<Frame, DATA_QUEUE_CAPACITY, Opener>> {
-        self.sessions
-            .get(&client)
-            .and_then(|s| s.data_channels.outbound(channel))
+            .and_then(|s| s.data_channels.get(channel))
     }
 }
 
@@ -380,13 +351,12 @@ mod tests {
 
     #[test]
     #[serial]
-    fn driver_inbound_outbound_no_session() {
+    fn driver_channel_no_session() {
         with_clean_inbox(|| {
             let driver = Driver::new().unwrap();
             let fake_id = ClientId::generate();
 
-            assert!(driver.inbound(fake_id, ChannelId::new(1)).is_none());
-            assert!(driver.outbound(fake_id, ChannelId::new(1)).is_none());
+            assert!(driver.channel(fake_id, ChannelId::new(1)).is_none());
         });
     }
 
@@ -430,12 +400,12 @@ mod tests {
                     thread::sleep(Duration::from_millis(20));
                 }
 
-                // Check inbound channel exists and read data
+                // Check channel exists and read data
                 if let Some(id) = client_id {
-                    let inbound = driver.inbound(id, ChannelId::new(1));
-                    assert!(inbound.is_some(), "inbound channel should exist");
+                    let endpoint = driver.channel(id, ChannelId::new(1));
+                    assert!(endpoint.is_some(), "channel should exist");
 
-                    if let Some(consumer) = inbound {
+                    if let Some(DataEndpoint::Inbound(consumer)) = endpoint {
                         // Try a few times to read
                         for _ in 0..10 {
                             if let Some(frame) = consumer.pop() {
@@ -446,6 +416,8 @@ mod tests {
                             thread::sleep(Duration::from_millis(10));
                         }
                         panic!("Failed to read message from inbound channel");
+                    } else {
+                        panic!("Expected inbound channel");
                     }
                 }
 
@@ -459,10 +431,7 @@ mod tests {
 
             // Open TX channel
             let tx = client
-                .open_data_tx::<TestMsg>(
-                    ChannelId::new(1),
-                    Timeout::Duration(Duration::from_secs(1)),
-                )
+                .open_data_tx::<TestMsg>(ChannelId::new(1), Duration::from_secs(1))
                 .unwrap();
 
             // Send data

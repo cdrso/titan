@@ -1,10 +1,9 @@
 //! Client-side control connection to a driver.
 
-use crate::control::handshake::client_handshake;
+use crate::control::handshake::client_connect;
 use crate::control::types::{
-    CONTROL_QUEUE_CAPACITY, ChannelId, ClientCommand, ClientMessage, ConnectionError,
-    ControlConnection, DATA_QUEUE_CAPACITY, DATA_READY_TIMEOUT, DriverMessage, TypeId,
-    data_rx_path, data_tx_path,
+    ChannelId, ClientCommand, ClientMessage, ClientRole, ConnectionError, ControlConnection,
+    DATA_QUEUE_CAPACITY, DriverMessage, TypeId, data_rx_path, data_tx_path,
 };
 use crate::data::{DEFAULT_FRAME_CAP, Frame, TypedConsumer, TypedProducer, Wire};
 use crate::ipc::shmem::{Creator, ShmPath};
@@ -14,10 +13,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-type ClientControlConnection = ControlConnection<
-    Producer<ClientMessage, CONTROL_QUEUE_CAPACITY, Creator>,
-    Consumer<DriverMessage, CONTROL_QUEUE_CAPACITY, Creator>,
->;
+type ClientControlConnection = ControlConnection<ClientRole>;
 
 /// A connected client that can send commands to and receive messages from a driver.
 ///
@@ -37,7 +33,7 @@ impl Client {
     /// - [`ConnectionError::QueueFull`] if the control queue is full
     /// - [`ConnectionError::Shm`] for shared memory creation/open failures
     pub fn connect(driver_inbox_path: ShmPath, timeout: Timeout) -> Result<Self, ConnectionError> {
-        let control_conn = client_handshake(driver_inbox_path, timeout)?;
+        let control_conn = client_connect(driver_inbox_path, timeout)?;
         Ok(Self {
             control_conn,
             pending: RefCell::new(VecDeque::new()),
@@ -106,7 +102,7 @@ impl Client {
     pub fn open_data_tx<T: Wire>(
         &self,
         channel: ChannelId,
-        timeout: Timeout,
+        timeout: Duration,
     ) -> Result<TypedProducer<T, DEFAULT_FRAME_CAP, DATA_QUEUE_CAPACITY, Creator>, ConnectionError>
     {
         let path = data_tx_path(&self.control_conn.id, channel);
@@ -121,7 +117,7 @@ impl Client {
             }))
             .map_err(|_| ConnectionError::QueueFull)?;
 
-        wait_for_ready(self, channel, timeout, DATA_READY_TIMEOUT)?;
+        wait_for_ready(self, channel, timeout)?;
         Ok(TypedProducer::new(queue_producer_raw))
     }
 
@@ -139,7 +135,7 @@ impl Client {
     pub fn open_data_rx<T: Wire>(
         &self,
         channel: ChannelId,
-        timeout: Timeout,
+        timeout: Duration,
     ) -> Result<TypedConsumer<T, DEFAULT_FRAME_CAP, DATA_QUEUE_CAPACITY, Creator>, ConnectionError>
     {
         let queue_path = data_rx_path(&self.control_conn.id, channel);
@@ -154,8 +150,7 @@ impl Client {
             }))
             .map_err(|_| ConnectionError::QueueFull)?;
 
-        wait_for_ready(self, channel, timeout, DATA_READY_TIMEOUT)?;
-
+        wait_for_ready(self, channel, timeout)?;
         Ok(TypedConsumer::new(queue_consumer_raw))
     }
 
@@ -174,40 +169,25 @@ impl Client {
 fn wait_for_ready(
     client: &Client,
     target: ChannelId,
-    timeout: Timeout,
-    default_timeout: Duration,
+    timeout: Duration,
 ) -> Result<(), ConnectionError> {
-    let deadline = match timeout {
-        Timeout::Infinite => None,
-        Timeout::Duration(d) => Some(Instant::now() + d),
-    };
-    let default_deadline = Instant::now() + default_timeout;
+    let deadline = Instant::now() + timeout;
 
     loop {
-        let remaining = match deadline {
-            Some(dl) => {
-                if let Some(remaining) = dl.checked_duration_since(Instant::now()) {
-                    Timeout::Duration(remaining)
-                } else {
-                    return Err(ConnectionError::Timeout);
-                }
-            }
-            None => match default_deadline.checked_duration_since(Instant::now()) {
-                Some(remaining) => Timeout::Duration(remaining),
-                None => return Err(ConnectionError::Timeout),
-            },
-        };
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(ConnectionError::Timeout)?;
 
-        match client.control_conn.rx.pop_blocking(remaining) {
-            Some(DriverMessage::ChannelReady(open)) if open == target => return Ok(()),
-            Some(DriverMessage::ChannelError(open)) if open == target => {
-                return Err(ConnectionError::ProtocolViolation);
-            }
-            Some(DriverMessage::ChannelClosed(open)) if open == target => {
+        match client
+            .control_conn
+            .rx
+            .pop_blocking(Timeout::Duration(remaining))
+        {
+            Some(DriverMessage::ChannelReady(ch)) if ch == target => return Ok(()),
+            Some(DriverMessage::ChannelError(ch)) if ch == target => {
                 return Err(ConnectionError::ProtocolViolation);
             }
             Some(other) => {
-                // Preserve unrelated messages for normal recv paths.
                 client.pending.borrow_mut().push_back(other);
             }
             None => return Err(ConnectionError::Timeout),
@@ -405,10 +385,7 @@ mod tests {
             struct TestData(u32);
 
             let producer = client
-                .open_data_tx::<TestData>(
-                    ChannelId::new(1),
-                    Timeout::Duration(Duration::from_secs(1)),
-                )
+                .open_data_tx::<TestData>(ChannelId::new(1), Duration::from_secs(1))
                 .unwrap();
 
             // Send some data
@@ -443,10 +420,7 @@ mod tests {
             struct TestData(u32);
 
             let _consumer = client
-                .open_data_rx::<TestData>(
-                    ChannelId::new(2),
-                    Timeout::Duration(Duration::from_secs(1)),
-                )
+                .open_data_rx::<TestData>(ChannelId::new(2), Duration::from_secs(1))
                 .unwrap();
 
             client.disconnect();
@@ -483,12 +457,12 @@ mod tests {
 
             // Open TX channel (client -> driver)
             let tx = client
-                .open_data_tx::<Msg>(ChannelId::new(1), Timeout::Duration(Duration::from_secs(1)))
+                .open_data_tx::<Msg>(ChannelId::new(1), Duration::from_secs(1))
                 .unwrap();
 
             // Open RX channel (driver -> client)
             let _rx = client
-                .open_data_rx::<Msg>(ChannelId::new(2), Timeout::Duration(Duration::from_secs(1)))
+                .open_data_rx::<Msg>(ChannelId::new(2), Duration::from_secs(1))
                 .unwrap();
 
             // Send data
@@ -523,7 +497,7 @@ mod tests {
             struct Data(u8);
 
             let _tx = client
-                .open_data_tx::<Data>(ChannelId::new(5), Timeout::Duration(Duration::from_secs(1)))
+                .open_data_tx::<Data>(ChannelId::new(5), Duration::from_secs(1))
                 .unwrap();
 
             // Close the channel
