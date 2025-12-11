@@ -1,9 +1,7 @@
 //! Type-safe wrappers for SPSC producers and consumers over shared memory.
 //!
 //! These wrappers encapsulate the serialization/deserialization of user-defined
-//! message types (`T`) into and out of `Frame`s, providing compile-time
-//! guarantees for message types on data channels.
-
+//! message types (`T`) into and out of `Frame`s
 use crate::data::{Frame, FrameError, Wire};
 use crate::ipc::shmem::{ShmError, ShmMode};
 use crate::ipc::spsc::{Consumer as SpscConsumer, Producer as SpscProducer, Timeout};
@@ -127,20 +125,6 @@ impl<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode>
             .map(|frame| frame.decode().map_err(TypedChannelError::Frame))
     }
 
-    /// Attempts to receive a message (wait-free) with explicit error signaling.
-    ///
-    /// Returns `Ok(None)` if the queue is empty.
-    /// Returns `Ok(Some(msg))` on success.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(TypedChannelError::Frame)` if deserialization fails.
-    pub fn recv_result(&self) -> Result<Option<T>, TypedChannelError> {
-        self.consumer.pop().map_or(Ok(None), |frame| {
-            frame.decode().map(Some).map_err(TypedChannelError::Frame)
-        })
-    }
-
     /// Receives a message, blocking until available.
     ///
     /// Returns `None` on timeout.
@@ -152,21 +136,6 @@ impl<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode>
             .map(|frame| frame.decode().map_err(TypedChannelError::Frame))
     }
 
-    /// Receives a message, blocking until available, with explicit timeout error.
-    ///
-    /// Returns `Ok(Some(msg))` on success.
-    ///
-    /// # Errors
-    ///
-    /// - [`TypedChannelError::Timeout`] on timeout
-    /// - [`TypedChannelError::Frame`] if deserialization fails
-    pub fn recv_blocking_result(&self, timeout: Timeout) -> Result<Option<T>, TypedChannelError> {
-        self.consumer
-            .pop_blocking(timeout)
-            .map_or(Err(TypedChannelError::Timeout), |frame| {
-                frame.decode().map(Some).map_err(TypedChannelError::Frame)
-            })
-    }
 }
 
 #[cfg(test)]
@@ -230,22 +199,6 @@ mod tests {
             TypedConsumer::new(raw_consumer);
 
         assert!(consumer.recv().is_none());
-    }
-
-    #[test]
-    fn typed_recv_result_empty_returns_ok_none() {
-        let path = unique_path("result-empty");
-
-        let raw_producer =
-            Producer::<Frame<TEST_CAP>, TEST_QUEUE, Creator>::create(path.clone()).unwrap();
-        let raw_consumer = Consumer::<Frame<TEST_CAP>, TEST_QUEUE, _>::open(path).unwrap();
-
-        let _producer: TypedProducer<TestMsg, TEST_CAP, TEST_QUEUE, _> =
-            TypedProducer::new(raw_producer);
-        let consumer: TypedConsumer<TestMsg, TEST_CAP, TEST_QUEUE, _> =
-            TypedConsumer::new(raw_consumer);
-
-        assert_eq!(consumer.recv_result().unwrap(), None);
     }
 
     #[test]
@@ -317,23 +270,6 @@ mod tests {
 
         let result = consumer.recv_blocking(Timeout::Duration(Duration::from_millis(10)));
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn typed_blocking_result_timeout_error() {
-        let path = unique_path("timeout-result");
-
-        let raw_producer =
-            Producer::<Frame<TEST_CAP>, TEST_QUEUE, Creator>::create(path.clone()).unwrap();
-        let raw_consumer = Consumer::<Frame<TEST_CAP>, TEST_QUEUE, _>::open(path).unwrap();
-
-        let _producer: TypedProducer<TestMsg, TEST_CAP, TEST_QUEUE, _> =
-            TypedProducer::new(raw_producer);
-        let consumer: TypedConsumer<TestMsg, TEST_CAP, TEST_QUEUE, _> =
-            TypedConsumer::new(raw_consumer);
-
-        let result = consumer.recv_blocking_result(Timeout::Duration(Duration::from_millis(10)));
-        assert!(matches!(result, Err(TypedChannelError::Timeout)));
     }
 
     #[test]
