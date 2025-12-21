@@ -124,6 +124,7 @@ impl Session {
         }
     }
 
+    //TODO do we need to manually drop??
     fn close_data_channel(&mut self, channel: ChannelId) {
         if let Some(endpoint) = self.data_channels.close(channel) {
             match endpoint {
@@ -184,6 +185,7 @@ impl Driver {
     /// Returns the IDs of disconnected clients.
     pub fn tick(&mut self, timeout: Duration) -> Vec<ClientId> {
         // TODO we are creating a vector on every tick... bad but lets get it working first
+        // also TODO, we are moving this logic into the runtime module... is this deprecated?
         let mut disconnected = Vec::new();
         let now = Instant::now();
 

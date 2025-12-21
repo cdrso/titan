@@ -5,18 +5,22 @@
 use crate::data::{Frame, FrameError, Wire};
 use crate::ipc::shmem::{ShmError, ShmMode};
 use crate::ipc::spsc::{Consumer as SpscConsumer, Producer as SpscProducer, Timeout};
-use std::fmt;
+use thiserror::Error;
 
 /// Errors that can occur when sending/receiving typed messages.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum TypedChannelError {
     /// An error occurred during shared memory operations or SPSC queue.
+    #[error("shared memory error: {0}")]
     Shm(ShmError),
     /// An error occurred during message serialization/deserialization.
+    #[error("frame serialization error: {0}")]
     Frame(FrameError),
     /// The channel operation timed out.
+    #[error("channel operation timed out")]
     Timeout,
     /// Message queue is full.
+    #[error("message queue is full")]
     QueueFull,
 }
 
@@ -32,28 +36,17 @@ impl From<FrameError> for TypedChannelError {
     }
 }
 
-impl fmt::Display for TypedChannelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Shm(e) => write!(f, "shared memory error: {e}"),
-            Self::Frame(e) => write!(f, "frame serialization error: {e:?}"),
-            Self::Timeout => write!(f, "channel operation timed out"),
-            Self::QueueFull => write!(f, "message queue is full"),
-        }
-    }
-}
-
 /// Type-safe producer for a data channel.
 ///
 /// Wraps an SPSC producer for `Frame`s, handling the serialization of messages
 /// of type `T` into frames.
-pub struct TypedProducer<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode> {
+pub struct MessageSender<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode> {
     producer: SpscProducer<Frame<FRAME_CAP>, QUEUE_CAP, Mode>,
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode>
-    TypedProducer<T, FRAME_CAP, QUEUE_CAP, Mode>
+    MessageSender<T, FRAME_CAP, QUEUE_CAP, Mode>
 {
     /// Creates a new typed producer wrapping an SPSC producer.
     #[must_use]
@@ -97,13 +90,13 @@ impl<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode>
 ///
 /// Wraps an SPSC consumer for `Frame`s, handling the deserialization of messages
 /// of type `T` from frames.
-pub struct TypedConsumer<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode> {
+pub struct MessageReceiver<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode> {
     consumer: SpscConsumer<Frame<FRAME_CAP>, QUEUE_CAP, Mode>,
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode>
-    TypedConsumer<T, FRAME_CAP, QUEUE_CAP, Mode>
+    MessageReceiver<T, FRAME_CAP, QUEUE_CAP, Mode>
 {
     /// Creates a new typed consumer wrapping an SPSC consumer.
     #[must_use]
@@ -168,10 +161,10 @@ mod tests {
             Producer::<Frame<TEST_CAP>, TEST_QUEUE, Creator>::create(path.clone()).unwrap();
         let raw_consumer = Consumer::<Frame<TEST_CAP>, TEST_QUEUE, _>::open(path).unwrap();
 
-        let producer: TypedProducer<TestMsg, TEST_CAP, TEST_QUEUE, _> =
-            TypedProducer::new(raw_producer);
-        let consumer: TypedConsumer<TestMsg, TEST_CAP, TEST_QUEUE, _> =
-            TypedConsumer::new(raw_consumer);
+        let producer: MessageSender<TestMsg, TEST_CAP, TEST_QUEUE, _> =
+            MessageSender::new(raw_producer);
+        let consumer: MessageReceiver<TestMsg, TEST_CAP, TEST_QUEUE, _> =
+            MessageReceiver::new(raw_consumer);
 
         let msg = TestMsg {
             id: 42,
@@ -192,10 +185,10 @@ mod tests {
             Producer::<Frame<TEST_CAP>, TEST_QUEUE, Creator>::create(path.clone()).unwrap();
         let raw_consumer = Consumer::<Frame<TEST_CAP>, TEST_QUEUE, _>::open(path).unwrap();
 
-        let _producer: TypedProducer<TestMsg, TEST_CAP, TEST_QUEUE, _> =
-            TypedProducer::new(raw_producer);
-        let consumer: TypedConsumer<TestMsg, TEST_CAP, TEST_QUEUE, _> =
-            TypedConsumer::new(raw_consumer);
+        let _producer: MessageSender<TestMsg, TEST_CAP, TEST_QUEUE, _> =
+            MessageSender::new(raw_producer);
+        let consumer: MessageReceiver<TestMsg, TEST_CAP, TEST_QUEUE, _> =
+            MessageReceiver::new(raw_consumer);
 
         assert!(consumer.recv().is_none());
     }
@@ -208,10 +201,10 @@ mod tests {
             Producer::<Frame<TEST_CAP>, TEST_QUEUE, Creator>::create(path.clone()).unwrap();
         let raw_consumer = Consumer::<Frame<TEST_CAP>, TEST_QUEUE, _>::open(path).unwrap();
 
-        let producer: TypedProducer<TestMsg, TEST_CAP, TEST_QUEUE, _> =
-            TypedProducer::new(raw_producer);
-        let consumer: TypedConsumer<TestMsg, TEST_CAP, TEST_QUEUE, _> =
-            TypedConsumer::new(raw_consumer);
+        let producer: MessageSender<TestMsg, TEST_CAP, TEST_QUEUE, _> =
+            MessageSender::new(raw_producer);
+        let consumer: MessageReceiver<TestMsg, TEST_CAP, TEST_QUEUE, _> =
+            MessageReceiver::new(raw_consumer);
 
         for i in 0..5 {
             let msg = TestMsg {
@@ -237,7 +230,7 @@ mod tests {
         let raw_producer = Producer::<Frame<TEST_CAP>, 4, Creator>::create(path.clone()).unwrap();
         let _raw_consumer = Consumer::<Frame<TEST_CAP>, 4, _>::open(path).unwrap();
 
-        let producer: TypedProducer<TestMsg, TEST_CAP, 4, _> = TypedProducer::new(raw_producer);
+        let producer: MessageSender<TestMsg, TEST_CAP, 4, _> = MessageSender::new(raw_producer);
 
         let msg = TestMsg {
             id: 0,
@@ -262,10 +255,10 @@ mod tests {
             Producer::<Frame<TEST_CAP>, TEST_QUEUE, Creator>::create(path.clone()).unwrap();
         let raw_consumer = Consumer::<Frame<TEST_CAP>, TEST_QUEUE, _>::open(path).unwrap();
 
-        let _producer: TypedProducer<TestMsg, TEST_CAP, TEST_QUEUE, _> =
-            TypedProducer::new(raw_producer);
-        let consumer: TypedConsumer<TestMsg, TEST_CAP, TEST_QUEUE, _> =
-            TypedConsumer::new(raw_consumer);
+        let _producer: MessageSender<TestMsg, TEST_CAP, TEST_QUEUE, _> =
+            MessageSender::new(raw_producer);
+        let consumer: MessageReceiver<TestMsg, TEST_CAP, TEST_QUEUE, _> =
+            MessageReceiver::new(raw_consumer);
 
         let result = consumer.recv_blocking(Timeout::Duration(Duration::from_millis(10)));
         assert!(result.is_none());

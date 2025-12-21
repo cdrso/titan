@@ -1,6 +1,7 @@
 //! Frame-based wire format for typed messages.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use type_hash::TypeHash;
 
 use crate::SharedMemorySafe;
@@ -57,12 +58,35 @@ impl<const N: usize> Default for Frame<N> {
     }
 }
 
+impl<const N: usize> TryFrom<&[u8]> for Frame<N> {
+    type Error = FrameError;
+
+    /// Create a frame from raw bytes (already serialized payload).
+    ///
+    /// Copies `bytes` into the frame payload and sets the length.
+    ///
+    /// # Errors
+    /// Returns [`FrameError::LenOutOfBounds`] if `bytes` exceed the frame capacity or `u16::MAX`.
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let len = bytes.len();
+        if len > N {
+            return Err(FrameError::LenOutOfBounds { len, cap: N });
+        }
+        let mut frame = Self::new();
+        frame.len = u16::try_from(len).map_err(|_| FrameError::LenOutOfBounds { len, cap: N })?;
+        frame.payload[..len].copy_from_slice(bytes);
+        Ok(frame)
+    }
+}
+
 /// Errors from frame encoding or decoding.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum FrameError {
     /// Serialization or deserialization failed.
+    #[error("frame serialization failed: {0}")]
     Serialize(postcard::Error),
     /// Message length exceeds frame capacity.
+    #[error("frame length {len} exceeds capacity {cap}")]
     LenOutOfBounds {
         /// Actual message length.
         len: usize,
@@ -251,5 +275,53 @@ mod tests {
         // Length might differ if values serialize differently
         assert!(frame.len() > 0);
         let _ = len1; // Acknowledge we captured it
+    }
+
+    #[test]
+    fn try_from_bytes_success() {
+        let data = [1u8, 2, 3, 4, 5];
+        let frame: Frame<64> = (&data[..]).try_into().unwrap();
+        assert_eq!(frame.len(), 5);
+        assert_eq!(frame.payload(), &data);
+    }
+
+    #[test]
+    fn try_from_bytes_empty() {
+        let data: [u8; 0] = [];
+        let frame: Frame<64> = (&data[..]).try_into().unwrap();
+        assert!(frame.is_empty());
+        assert_eq!(frame.payload(), &[]);
+    }
+
+    #[test]
+    fn try_from_bytes_exact_capacity() {
+        let data = [0xABu8; 32];
+        let frame: Frame<32> = (&data[..]).try_into().unwrap();
+        assert_eq!(frame.len(), 32);
+        assert_eq!(frame.payload(), &data);
+    }
+
+    #[test]
+    fn try_from_bytes_exceeds_capacity() {
+        let data = [0u8; 65];
+        let result: Result<Frame<64>, _> = (&data[..]).try_into();
+        assert!(matches!(
+            result,
+            Err(FrameError::LenOutOfBounds { len: 65, cap: 64 })
+        ));
+    }
+
+    #[test]
+    fn try_from_bytes_roundtrip_with_decode() {
+        // Encode a message, get bytes, reconstruct frame, decode
+        let msg = Sample { a: 42, b: 7 };
+        let mut original = Frame::<64>::new();
+        original.encode(&msg).unwrap();
+
+        let bytes = original.payload();
+        let reconstructed: Frame<64> = bytes.try_into().unwrap();
+
+        let decoded: Sample = reconstructed.decode().unwrap();
+        assert_eq!(decoded, msg);
     }
 }

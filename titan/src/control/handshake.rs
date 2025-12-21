@@ -14,7 +14,7 @@ type DriverConn = ControlConnection<DriverRole>;
 /// Client-side handshake: create control queues, send Hello, await Welcome.
 ///
 /// # Errors
-/// - [`ConnectionError::QueueFull`] if control queue is full during Hello or registration
+/// - [`ConnectionError::QueueFull`] if control queue is full during Hello or registration (which should not happen)
 /// - [`ConnectionError::Timeout`] if Welcome is not received before the deadline
 /// - [`ConnectionError::ProtocolViolation`] if the driver responds with an unexpected message
 /// - [`ConnectionError::Shm`] for shared memory creation/open failures

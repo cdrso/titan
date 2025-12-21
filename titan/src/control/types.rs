@@ -3,8 +3,8 @@
 use crate::SharedMemorySafe;
 use crate::ipc::shmem::{Creator, Opener, ShmError, ShmMode, ShmPath};
 use crate::ipc::spsc::{Consumer, Producer};
-use std::fmt;
 use std::time::Duration;
+use thiserror::Error;
 use type_hash::TypeHash;
 
 /// Capacity of per-client control message queues (tx and rx).
@@ -127,7 +127,7 @@ impl From<ChannelId> for u32 {
 
 /// Unique identifier for a data message type
 #[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)] // Newtype for u64
+#[repr(transparent)]
 pub struct TypeId(u64);
 
 impl TypeId {
@@ -211,35 +211,28 @@ pub enum DriverMessage {
 }
 
 /// Errors that can occur during connection establishment or communication.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ConnectionError {
     /// Shared memory operation failed.
+    #[error("shared memory error: {0}")]
     Shm(ShmError),
     /// Timed out waiting for response.
+    #[error("timed out waiting for response")]
     Timeout,
     /// Received unexpected message type.
+    #[error("protocol violation")]
     ProtocolViolation,
     /// Message queue is full.
+    #[error("queue full")]
     QueueFull,
     /// Client ID in handshake doesn't match expected.
+    #[error("client ID mismatch")]
     IdMismatch,
 }
 
 impl From<ShmError> for ConnectionError {
     fn from(e: ShmError) -> Self {
         Self::Shm(e)
-    }
-}
-
-impl fmt::Display for ConnectionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Shm(e) => write!(f, "shared memory error: {e}"),
-            Self::Timeout => write!(f, "timed out waiting for response"),
-            Self::ProtocolViolation => write!(f, "protocol violation"),
-            Self::QueueFull => write!(f, "queue full"),
-            Self::IdMismatch => write!(f, "client ID mismatch"),
-        }
     }
 }
 

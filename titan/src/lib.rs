@@ -4,6 +4,7 @@ extern crate self as titan;
 pub mod control;
 pub mod data;
 pub mod ipc;
+pub mod runtime;
 
 #[doc(inline)]
 pub use titan_derive::SharedMemorySafe;

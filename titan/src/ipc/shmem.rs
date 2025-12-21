@@ -60,30 +60,37 @@ use std::sync::atomic::{
     AtomicBool, AtomicI8, AtomicI16, AtomicI32, AtomicI64, AtomicIsize, AtomicU8, AtomicU16,
     AtomicU32, AtomicU64, AtomicUsize,
 };
+use thiserror::Error;
 
 /// Result alias for shared memory operations.
 pub type Result<T> = std::result::Result<T, ShmError>;
 
 /// Contextual errors produced by [`Shm`].
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ShmError {
     /// The provided POSIX shared memory name is invalid.
+    #[error("invalid shared memory path `{path}`: {reason}")]
     InvalidPath { path: String, reason: &'static str },
     /// `mmap`, `shm_open`, `ftruncate`, etc. failed with an errno.
+    #[error("{op} failed for `{path}`: {source}")]
     PosixError {
         op: &'static str,
         path: String,
+        #[source]
         source: io::Errno,
     },
     /// The existing shared memory object has a different size than `T`.
+    #[error("shared memory `{path}` size mismatch: expected {expected} bytes, got {actual}")]
     SizeMismatch {
         path: String,
         expected: usize,
         actual: i64,
     },
     /// Timed out waiting for shared memory to be initialized by creator.
+    #[error("timed out waiting for `{path}` to be initialized")]
     InitTimeout { path: String },
     /// Type alignment exceeds system page size.
+    #[error("type alignment ({type_align} bytes) exceeds system page size ({page_size} bytes)")]
     AlignmentExceedsPageSize { type_align: usize, page_size: usize },
 }
 
@@ -93,46 +100,6 @@ impl ShmError {
             op,
             path: path.to_string(),
             source: err,
-        }
-    }
-}
-
-impl fmt::Display for ShmError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidPath { path, reason } => {
-                write!(f, "invalid shared memory path `{path}`: {reason}")
-            }
-            Self::PosixError { op, path, source } => {
-                write!(f, "{op} failed for `{path}`: {source}")
-            }
-            Self::SizeMismatch {
-                path,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "shared memory `{path}` size mismatch: expected {expected} bytes, got {actual}"
-            ),
-            Self::InitTimeout { path } => {
-                write!(f, "timed out waiting for `{path}` to be initialized")
-            }
-            Self::AlignmentExceedsPageSize {
-                type_align,
-                page_size,
-            } => write!(
-                f,
-                "type alignment ({type_align} bytes) exceeds system page size ({page_size} bytes)"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ShmError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::PosixError { source, .. } => Some(source),
-            _ => None,
         }
     }
 }

@@ -77,21 +77,6 @@ impl From<Duration> for Timeout {
 const INIT_MAGIC: u64 = 0x5350_5343_494E_4954; // "SPSCINIT" in ASCII
 const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-// =============================================================================
-// Role Marker Types
-// =============================================================================
-//
-// These zero-sized marker types provide **nominal type safety** for internal
-// fields. While `unsafe` code could bypass them, they serve two purposes:
-//
-// 1. **Specification**: The type `ProducerCache<usize>` vs `ConsumerCache<usize>`
-//    documents ownership intent in the type system (Level 1), which is superior
-//    to documentation comments (Level 0) per Cardelli's type theory.
-//
-// 2. **Logic Error Prevention**: Accidentally passing a consumer's cache to a
-//    function expecting a producer's cache becomes a compile-time type error,
-//    even though both wrap the same underlying type.
-
 /// Role marker: Fields with this role are owned exclusively by the producer.
 ///
 /// The producer is the only entity that reads/writes these fields.
@@ -115,19 +100,6 @@ struct SlotRole;
 /// `SpscCell<T, Role>` wraps an `UnsafeCell<T>` with a phantom `Role` parameter.
 /// The `Role` doesn't affect runtime behavior—it exists purely to make different
 /// logical "kinds" of cells into distinct types at compile time.
-///
-/// # Why Role Markers?
-///
-/// Consider two fields: `cursor: usize` in `ProducerState` and `cursor: usize`
-/// in `ConsumerState`. Without role markers, both would have type `UnsafeCell<usize>`.
-/// With role markers:
-///
-/// - Producer's cursor: `SpscCell<usize, ProducerRole>`
-/// - Consumer's cursor: `SpscCell<usize, ConsumerRole>`
-///
-/// These are now **nominally distinct types**. A function that expects
-/// `&SpscCell<usize, ProducerRole>` won't accept `&SpscCell<usize, ConsumerRole>`,
-/// catching logic errors at compile time.
 #[repr(transparent)]
 struct SpscCell<T, Role>(UnsafeCell<T>, PhantomData<Role>);
 
@@ -179,8 +151,6 @@ struct ProducerState {
     head: AtomicUsize,
 
     /// Producer-local cursor tracking `head % N`.
-    /// Invariant: always in range `[0, N)`.
-    /// Avoids modulo division on each push by incrementing with wrap.
     cursor: ProducerCache<usize>,
 
     /// Cached copy of tail index.
@@ -206,8 +176,6 @@ struct ConsumerState {
     tail: AtomicUsize,
 
     /// Consumer-local cursor tracking `tail % N`.
-    /// Invariant: always in range `[0, N)`.
-    /// Avoids modulo division on each pop by incrementing with wrap.
     cursor: ConsumerCache<usize>,
 
     /// Cached copy of head index.
@@ -262,10 +230,6 @@ impl<T: SharedMemorySafe, const N: usize> SpscQueue<T, N> {
     ///
     /// This is equivalent to `(cursor + 1) % N` but avoids the division instruction,
     /// using a comparison and conditional move instead.
-    ///
-    /// # Invariant
-    ///
-    /// If `cursor < N`, then the result is also `< N`.
     #[inline]
     const fn bump_cursor(cursor: usize) -> usize {
         let next = cursor + 1;
@@ -275,8 +239,7 @@ impl<T: SharedMemorySafe, const N: usize> SpscQueue<T, N> {
     /// Initializes the queue directly inside shared memory.
     ///
     /// The signature `&mut MaybeUninit<Self>` explicitly models that the memory is
-    /// allocated but uninitialized—this is semantically honest per Cardelli's
-    /// "types as specifications" principle.
+    /// allocated but uninitialized.
     ///
     /// Writes default values for producer and consumer state, then sets the magic
     /// marker with `Release` ordering to signal initialization is complete. The buffer
@@ -340,7 +303,6 @@ impl<T: SharedMemorySafe, const N: usize> SpscQueue<T, N> {
             if start.elapsed() >= timeout {
                 return false;
             }
-            std::hint::spin_loop();
         }
     }
 }
@@ -667,20 +629,6 @@ impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Consumer<T, N, Mode> {
 mod tests {
     use super::*;
     use crate::ipc::shmem::ShmPath;
-    use rustix::io;
-
-    macro_rules! unwrap_or_skip {
-        ($expr:expr) => {
-            match $expr {
-                Ok(value) => value,
-                Err(ShmError::PosixError { source, .. }) if source == io::Errno::ACCESS => {
-                    eprintln!("Skipping test due to shared memory permission denial");
-                    return;
-                }
-                Err(err) => panic!("Unexpected shared memory error: {err}"),
-            }
-        };
-    }
 
     const CACHE_LINE_SIZE: usize = 64;
 
@@ -718,8 +666,8 @@ mod tests {
     #[test]
     fn test_basic_push_pop() {
         let path = ShmPath::new("/test-basic-push-pop").unwrap();
-        let producer = unwrap_or_skip!(Producer::<u64, 8, _>::create(path.clone()));
-        let consumer = unwrap_or_skip!(Consumer::<u64, 8, _>::open(path));
+        let producer = Producer::<u64, 8, _>::create(path.clone()).unwrap();
+        let consumer = Consumer::<u64, 8, _>::open(path).unwrap();
 
         // Push a single item
         assert!(producer.push(42).is_ok());
@@ -734,8 +682,8 @@ mod tests {
     #[test]
     fn test_multiple_items() {
         let path = ShmPath::new("/test-multiple-items").unwrap();
-        let producer = unwrap_or_skip!(Producer::<u64, 16, _>::create(path.clone()));
-        let consumer = unwrap_or_skip!(Consumer::<u64, 16, _>::open(path));
+        let producer = Producer::<u64, 16, _>::create(path.clone()).unwrap();
+        let consumer = Consumer::<u64, 16, _>::open(path).unwrap();
 
         // Push multiple items
         for i in 0..10 {
@@ -754,8 +702,8 @@ mod tests {
     #[test]
     fn test_queue_full() {
         let path = ShmPath::new("/test-queue-full").unwrap();
-        let producer = unwrap_or_skip!(Producer::<u64, 4, _>::create(path.clone()));
-        let consumer = unwrap_or_skip!(Consumer::<u64, 4, _>::open(path));
+        let producer = Producer::<u64, 4, _>::create(path.clone()).unwrap();
+        let consumer = Consumer::<u64, 4, _>::open(path).unwrap();
 
         // Fill the queue (capacity is 4)
         for i in 0..4 {
@@ -778,8 +726,8 @@ mod tests {
     #[test]
     fn test_queue_empty() {
         let path = ShmPath::new("/test-queue-empty").unwrap();
-        let producer = unwrap_or_skip!(Producer::<u64, 8, _>::create(path.clone()));
-        let consumer = unwrap_or_skip!(Consumer::<u64, 8, _>::open(path));
+        let producer = Producer::<u64, 8, _>::create(path.clone()).unwrap();
+        let consumer = Consumer::<u64, 8, _>::open(path).unwrap();
 
         // Queue starts empty
         assert_eq!(consumer.pop(), None);
@@ -795,8 +743,8 @@ mod tests {
     #[test]
     fn test_wrapping_behavior() {
         let path = ShmPath::new("/test-wrapping").unwrap();
-        let producer = unwrap_or_skip!(Producer::<u64, 4, _>::create(path.clone()));
-        let consumer = unwrap_or_skip!(Consumer::<u64, 4, _>::open(path));
+        let producer = Producer::<u64, 4, _>::create(path.clone()).unwrap();
+        let consumer = Consumer::<u64, 4, _>::open(path).unwrap();
 
         // Fill, drain, refill multiple times to test index wrapping
         for round in 0..5 {
@@ -820,8 +768,8 @@ mod tests {
     #[test]
     fn test_interleaved_operations() {
         let path = ShmPath::new("/test-interleaved").unwrap();
-        let producer = unwrap_or_skip!(Producer::<u64, 8, _>::create(path.clone()));
-        let consumer = unwrap_or_skip!(Consumer::<u64, 8, _>::open(path));
+        let producer = Producer::<u64, 8, _>::create(path.clone()).unwrap();
+        let consumer = Consumer::<u64, 8, _>::open(path).unwrap();
 
         // Interleave push and pop operations
         producer.push(1).unwrap();
@@ -841,10 +789,10 @@ mod tests {
     fn test_consumer_creates_producer_opens() {
         // Daemon creates an inbox to receive from clients
         let path = ShmPath::new("/test-daemon-inbox").unwrap();
-        let consumer = unwrap_or_skip!(Consumer::<u64, 8, _>::create(path.clone()));
+        let consumer = Consumer::<u64, 8, _>::create(path.clone()).unwrap();
 
         // Client opens the inbox to send to daemon
-        let producer = unwrap_or_skip!(Producer::<u64, 8, _>::open(path));
+        let producer = Producer::<u64, 8, _>::open(path).unwrap();
 
         // Client sends messages to daemon
         producer.push(100).unwrap();
@@ -860,8 +808,8 @@ mod tests {
     fn test_producer_creates_consumer_opens() {
         // Typical case: Producer creates, Consumer opens
         let path = ShmPath::new("/test-client-response").unwrap();
-        let producer = unwrap_or_skip!(Producer::<u64, 8, _>::create(path.clone()));
-        let consumer = unwrap_or_skip!(Consumer::<u64, 8, _>::open(path));
+        let producer = Producer::<u64, 8, _>::create(path.clone()).unwrap();
+        let consumer = Consumer::<u64, 8, _>::open(path).unwrap();
 
         producer.push(42).unwrap();
         assert_eq!(consumer.pop(), Some(42));

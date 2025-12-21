@@ -5,7 +5,7 @@ use crate::control::types::{
     ChannelId, ClientCommand, ClientMessage, ClientRole, ConnectionError, ControlConnection,
     DATA_QUEUE_CAPACITY, DriverMessage, TypeId, data_rx_path, data_tx_path,
 };
-use crate::data::{DEFAULT_FRAME_CAP, Frame, TypedConsumer, TypedProducer, Wire};
+use crate::data::{DEFAULT_FRAME_CAP, Frame, MessageReceiver, MessageSender, Wire};
 use crate::ipc::shmem::{Creator, ShmPath};
 use crate::ipc::spsc::{Consumer, Producer, Timeout};
 use minstant::Instant;
@@ -103,7 +103,7 @@ impl Client {
         &self,
         channel: ChannelId,
         timeout: Duration,
-    ) -> Result<TypedProducer<T, DEFAULT_FRAME_CAP, DATA_QUEUE_CAPACITY, Creator>, ConnectionError>
+    ) -> Result<MessageSender<T, DEFAULT_FRAME_CAP, DATA_QUEUE_CAPACITY, Creator>, ConnectionError>
     {
         let path = data_tx_path(&self.control_conn.id, channel);
         let queue_producer_raw =
@@ -118,7 +118,7 @@ impl Client {
             .map_err(|_| ConnectionError::QueueFull)?;
 
         wait_for_ready(self, channel, timeout)?;
-        Ok(TypedProducer::new(queue_producer_raw))
+        Ok(MessageSender::new(queue_producer_raw))
     }
 
     /// Opens a data RX channel and returns the consumer end.
@@ -136,7 +136,7 @@ impl Client {
         &self,
         channel: ChannelId,
         timeout: Duration,
-    ) -> Result<TypedConsumer<T, DEFAULT_FRAME_CAP, DATA_QUEUE_CAPACITY, Creator>, ConnectionError>
+    ) -> Result<MessageReceiver<T, DEFAULT_FRAME_CAP, DATA_QUEUE_CAPACITY, Creator>, ConnectionError>
     {
         let queue_path = data_rx_path(&self.control_conn.id, channel);
         let queue_consumer_raw =
@@ -151,7 +151,7 @@ impl Client {
             .map_err(|_| ConnectionError::QueueFull)?;
 
         wait_for_ready(self, channel, timeout)?;
-        Ok(TypedConsumer::new(queue_consumer_raw))
+        Ok(MessageReceiver::new(queue_consumer_raw))
     }
 
     /// Requests closure of a data channel (either direction).

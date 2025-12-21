@@ -685,6 +685,7 @@ dependencies = [
  "rustix",
  "serde",
  "serial_test",
+ "thiserror",
  "titan-derive",
  "trybuild",
  "type_hash",
