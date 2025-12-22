@@ -1,283 +1,301 @@
 //! Hashed timing wheel with O(1) schedule/cancel and bounded per-tick work.
-//!
-//! Single-level, power-of-two slots; per-thread, shared-nothing. Tick streams fired timers via
-//! callback to avoid per-tick allocation.
 
-use crate::runtime::timing::slab::{Entry, Slab, SlabIndex};
-use crate::runtime::timing::time::{Duration, TimeUnit, Timestamp};
+use core::num::NonZeroUsize;
+
+use thiserror::Error;
+
+use crate::runtime::timing::slab::{Slab, SlabIndex};
+use crate::runtime::timing::time::{Duration, MonoInstant, NonZeroDuration, Now, TimeUnit};
 
 /// Handle returned to callers; includes index and generation to detect stale use.
+// Manual Copy/Clone: derive would require T: Copy, but we only hold SlabIndex<T> (PhantomData).
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct TimerHandle<Role, T> {
+pub struct TimerHandle<T> {
+    /// Index into the slab.
     pub idx: SlabIndex<T>,
+    /// Generation for ABA protection.
     pub generation: u32,
-    pub _role: core::marker::PhantomData<Role>,
 }
 
-/// Wheel configuration (immutable after creation).
-pub struct WheelConfig {
-    pub slots: PowerOfTwo,
-    pub tick_ns: u64,
-    pub capacity: core::num::NonZeroUsize,
+impl<T> Copy for TimerHandle<T> {}
+
+impl<T> Clone for TimerHandle<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+/// Errors returned by wheel operations.
+#[derive(Debug, Error)]
+pub enum WheelError {
+    /// The requested delay exceeds the wheel's addressable range.
+    #[error("delay {delay} ticks exceeds maximum {max}")]
+    DelayTooLong {
+        /// Requested delay in ticks.
+        delay: u64,
+        /// Maximum addressable delay.
+        max: u64,
+    },
+    /// Arithmetic overflow computing deadline.
+    #[error("deadline overflow")]
+    Overflow,
+    /// No free slots remain in the slab.
+    #[error("timer capacity exhausted")]
+    Capacity,
 }
 
 /// Hashed timing wheel.
-pub struct Wheel<T, Role, U: TimeUnit> {
-    slots: Vec<Option<SlabIndex<T>>>, // head of list per slot
-    slab: Slab<T>,
-    mask: usize,
-    pub tick_ns: u64,
+pub struct Wheel<T, U: TimeUnit> {
+    slab: Slab<T>,                    // slot pool
+    slots: Vec<Option<SlabIndex<T>>>, // head of timer list per slot
+    start: MonoInstant<U>,
     cursor: u64, // current tick
-    pub max_fired_per_tick: usize,
-    pub max_slot_depth: usize,
-    pub slab_high_water: usize,
-    _role: core::marker::PhantomData<Role>,
-    _unit: core::marker::PhantomData<U>,
+    tick: NonZeroDuration<U>,
 }
 
-/// Witness type for power-of-two values.
-/// do we need this...?? its not a breaking thing but something we enforce... maybe get ridofit
-#[derive(Clone, Copy, Debug)]
-pub struct PowerOfTwo(usize);
-
-impl PowerOfTwo {
-    pub fn new(val: usize) -> Option<Self> {
-        if val.is_power_of_two() && val > 0 {
-            Some(Self(val))
-        } else {
-            None
-        }
-    }
-
-    pub fn get(self) -> usize {
-        self.0
-    }
-}
-
-impl<T, Role, U: TimeUnit> Wheel<T, Role, U> {
-    /// Convert a monotonic timestamp (nanoseconds) into wheel ticks using `tick_ns`.
-    #[inline]
-    pub fn instant_to_tick(&self, now_ns: u64) -> Timestamp<U> {
-        Timestamp::new(now_ns / self.tick_ns)
-    }
-
-    /// Create a new wheel. `slots` must be power of two.
-    pub fn new(cfg: WheelConfig) -> Self {
-        let slots_val = cfg.slots.get();
+impl<T, U> Wheel<T, U>
+where
+    U: TimeUnit + Now,
+{
+    /// Creates a new wheel starting at the current monotonic timestamp.
+    #[must_use]
+    pub fn new(slots: NonZeroUsize, tick: NonZeroDuration<U>, capacity: NonZeroUsize) -> Self {
         Self {
-            slots: vec![None; slots_val],
-            slab: Slab::with_capacity(cfg.capacity),
-            mask: slots_val - 1,
-            tick_ns: cfg.tick_ns,
+            slots: vec![None; slots.get()],
+            slab: Slab::with_capacity(capacity),
+            tick,
+            start: U::now(),
             cursor: 0,
-            max_fired_per_tick: 0,
-            max_slot_depth: 0,
-            slab_high_water: 0,
-            _role: core::marker::PhantomData,
-            _unit: core::marker::PhantomData,
         }
     }
 
-    /// Schedule a timer `delay_ticks` from now with payload `payload`.
-    pub fn schedule(&mut self, delay: Duration<U>, payload: T) -> Option<TimerHandle<Role, T>> {
-        let delay_ticks = delay.as_u64();
-        // Schedule relative to "next tick" to ensure delay=0 fires on next tick.
-        let deadline = self.cursor + 1 + delay_ticks;
-        let slot = (deadline as usize) & self.mask;
+    /// Maximum delay (in ticks) that can be scheduled
+    #[inline]
+    #[must_use]
+    pub fn max_delay_ticks(&self) -> u64 {
+        // Single-level wheel covers one full rotation.
+        u64::try_from(self.slots.len())
+            .unwrap_or(u64::MAX)
+            .saturating_sub(1)
+    }
+
+    /// Maps a tick to its slot index.
+    #[inline]
+    fn slot_index(&self, tick: u64) -> usize {
+        usize::try_from(tick % u64::try_from(self.slots.len()).unwrap_or(u64::MAX))
+            .expect("modulo result should not exceed usize")
+    }
+
+    /// Schedules a timer `delay` from now with payload `payload`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delay exceeds the wheel's range, arithmetic overflows,
+    /// or the slab is at capacity.
+    pub fn schedule(
+        &mut self,
+        delay: Duration<U>,
+        payload: T,
+    ) -> Result<TimerHandle<T>, WheelError> {
+        let ticks_needed = delay.div_ceil(Duration::from(self.tick));
+        let ticks_ahead = ticks_needed.max(1);
+        let max_delay = self.max_delay_ticks();
+        if ticks_ahead > max_delay {
+            return Err(WheelError::DelayTooLong {
+                delay: ticks_ahead,
+                max: max_delay,
+            });
+        }
+        let deadline = self
+            .cursor
+            .checked_add(ticks_ahead)
+            .ok_or(WheelError::Overflow)?;
+
+        let slot = self.slot_index(deadline);
         let head = self.slots[slot];
+
         let (idx, generation) = {
-            let (idx, node) = self.slab.alloc(payload, deadline)?;
+            let (idx, node) = self
+                .slab
+                .alloc(payload, deadline)
+                .ok_or(WheelError::Capacity)?;
             node.next = head;
             node.prev = None;
             let generation = node.generation;
             (idx, generation)
         };
+
         // Insert at head of slot list
-        if let Some(head_idx) = head {
-            if let Some(head) = self.slab.get_mut(head_idx) {
-                head.prev = Some(idx);
-            }
+        if let Some(head_idx) = head
+            && let Some(head_node) = self.slab.get_mut(head_idx)
+        {
+            head_node.prev = Some(idx);
         }
         self.slots[slot] = Some(idx);
-        self.slab_high_water = self
-            .slab_high_water
-            .max(self.slab.capacity() - self.free_slots());
-        Some(TimerHandle {
-            idx,
-            generation,
-            _role: core::marker::PhantomData,
-        })
+        Ok(TimerHandle { idx, generation })
     }
 
-    /// Cancel a timer by handle.
-    pub fn cancel(&mut self, handle: TimerHandle<Role, T>) -> bool {
-        if let Some(node) = self.slab.get(handle.idx) {
-            if node.generation != handle.generation {
-                return false;
-            }
-        } else {
+    /// Cancels a timer by handle. Returns `true` if the timer was found and cancelled.
+    pub fn cancel(&mut self, handle: TimerHandle<T>) -> bool {
+        let Some(node) = self.slab.get(handle.idx) else {
+            return false;
+        };
+        if node.generation != handle.generation {
             return false;
         }
 
         let idx = handle.idx;
+
         // Unlink from list
         if let Some(node) = self.slab.get_mut(idx) {
             let next = node.next;
             let prev = node.prev;
+            let deadline = node.deadline;
             if let Some(p) = prev {
                 if let Some(pnode) = self.slab.get_mut(p) {
                     pnode.next = next;
                 }
             } else {
                 // head of slot list; find slot
-                let slot = (node.deadline as usize) & self.mask;
+                let slot = self.slot_index(deadline);
                 self.slots[slot] = next;
             }
-            if let Some(n) = next {
-                if let Some(nnode) = self.slab.get_mut(n) {
-                    nnode.prev = prev;
-                }
+            if let Some(n) = next
+                && let Some(nnode) = self.slab.get_mut(n)
+            {
+                nnode.prev = prev;
             }
         }
 
         self.slab.free(idx).is_some()
     }
 
-    /// Advance the wheel to `now_tick` and invoke `on_fire` for each due timer.
+    /// Advances the wheel using the current monotonic timestamp and invokes `on_fire` for each due timer.
     ///
     /// `on_fire` receives the handle (for callers that stash it) and the payload by value.
-    /// No allocations occur during tick.
-    pub fn tick(&mut self, now: Timestamp<U>, mut on_fire: impl FnMut(TimerHandle<Role, T>, T)) {
-        let now_tick = now.as_u64();
+    pub fn tick(&mut self, mut on_fire: impl FnMut(TimerHandle<T>, T)) {
+        let now = U::now();
+        let elapsed = now - self.start;
+        let now_tick = elapsed / Duration::from(self.tick); // dimensionless tick count
         if now_tick <= self.cursor {
             return;
         }
         let mut tick = self.cursor + 1;
         while tick <= now_tick {
-            let slot = (tick as usize) & self.mask;
+            let slot = self.slot_index(tick);
             let mut head = self.slots[slot];
             let mut pending_head: Option<SlabIndex<T>> = None;
-            let mut slot_depth = 0;
-            let mut fired_count = 0;
             while let Some(idx) = head {
-                slot_depth += 1;
                 // Save next before we potentially move/free.
                 let next = self.slab.get(idx).and_then(|n| n.next);
-                let due = self
-                    .slab
-                    .get(idx)
-                    .map(|n| n.deadline <= now_tick)
-                    .unwrap_or(false);
+                let due = self.slab.get(idx).is_some_and(|n| n.deadline <= now_tick);
 
                 if due {
-                    if let Some(node) = self.slab.get_mut(idx) {
-                        if let Some(payload) = node.payload.take() {
-                            on_fire(
-                                TimerHandle {
-                                    idx,
-                                    generation: node.generation,
-                                    _role: core::marker::PhantomData,
-                                },
-                                payload,
-                            );
-                            fired_count += 1;
-                        }
+                    if let Some(node) = self.slab.get_mut(idx)
+                        && let Some(payload) = node.payload.take()
+                    {
+                        on_fire(
+                            TimerHandle {
+                                idx,
+                                generation: node.generation,
+                            },
+                            payload,
+                        );
                     }
-                    self.slab.free(idx);
+                    let _ = self.slab.free(idx);
                 } else {
                     // Keep pending by pushing to pending_head
                     if let Some(node) = self.slab.get_mut(idx) {
                         node.next = pending_head;
                         node.prev = None;
                     }
-                    if let Some(ph) = pending_head {
-                        if let Some(pnode) = self.slab.get_mut(ph) {
-                            pnode.prev = Some(idx);
-                        }
+                    if let Some(ph) = pending_head
+                        && let Some(pnode) = self.slab.get_mut(ph)
+                    {
+                        pnode.prev = Some(idx);
                     }
                     pending_head = Some(idx);
                 }
                 head = next;
             }
             self.slots[slot] = pending_head;
-            self.max_slot_depth = self.max_slot_depth.max(slot_depth);
-            self.max_fired_per_tick = self.max_fired_per_tick.max(fired_count);
             tick += 1;
         }
         self.cursor = now_tick;
-    }
-
-    /// Free slots remaining.
-    fn free_slots(&self) -> usize {
-        let mut count = 0;
-        let mut head = self.slab_free_head();
-        while let Some(idx) = head {
-            count += 1;
-            head = match &self.slab_entry(idx) {
-                Some(Entry::Free { next, .. }) => *next,
-                _ => None,
-            };
-        }
-        count
-    }
-
-    fn slab_free_head(&self) -> Option<SlabIndex<T>> {
-        self.slab.free_head
-    }
-
-    fn slab_entry(&self, idx: SlabIndex<T>) -> Option<&Entry<T>> {
-        self.slab.entries.get(idx.0 as usize)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::timing::time::Millis;
-    use std::num::NonZeroUsize;
+    use std::cell::Cell;
+    use std::num::{NonZeroU64, NonZeroUsize};
 
-    fn wheel_u32(capacity: usize) -> Wheel<u32, (), Millis> {
-        Wheel::new(WheelConfig {
-            slots: PowerOfTwo::new(8).unwrap(),
-            tick_ns: 1,
-            capacity: NonZeroUsize::new(capacity).unwrap(),
-        })
+    /// Deterministic unit for testing.
+    enum TestUnit {}
+
+    impl TimeUnit for TestUnit {
+        const NAME: &'static str = "test";
+    }
+
+    thread_local! {
+        static NOW: Cell<u64> = const { Cell::new(0) };
+    }
+
+    impl Now for TestUnit {
+        fn now() -> MonoInstant<Self> {
+            MonoInstant::new(NOW.with(Cell::get))
+        }
+    }
+
+    fn set_now(v: u64) {
+        NOW.with(|t| t.set(v));
+    }
+
+    fn wheel_u32(capacity: usize) -> Wheel<u32, TestUnit> {
+        set_now(0);
+        Wheel::new(
+            NonZeroUsize::new(8).unwrap(),
+            NonZeroDuration::<TestUnit>::new(NonZeroU64::new(1).unwrap()),
+            NonZeroUsize::new(capacity).unwrap(),
+        )
     }
 
     #[test]
     fn fires_due_timers_no_alloc() {
         let mut w = wheel_u32(4);
-        let h1 = w.schedule(Duration::<Millis>::new(0), 10).unwrap();
-        let h2 = w.schedule(Duration::<Millis>::new(1), 20).unwrap();
+        let h1 = w.schedule(Duration::<TestUnit>::new(0), 10).unwrap();
+        let h2 = w.schedule(Duration::<TestUnit>::new(1), 20).unwrap();
         let mut fired = Vec::new();
-        w.tick(Timestamp::<Millis>::new(1), |h, v| fired.push((h, v)));
-        assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].0, h1);
-        assert_eq!(fired[0].1, 10);
+        set_now(1);
+        w.tick(|h, v| fired.push((h, v)));
+        fired.sort_by_key(|(_, v)| *v);
+        assert_eq!(fired, vec![(h1, 10), (h2, 20)]);
 
         fired.clear();
-        w.tick(Timestamp::<Millis>::new(3), |h, v| fired.push((h, v)));
-        assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].0, h2);
-        assert_eq!(fired[0].1, 20);
+        set_now(3);
+        w.tick(|h, v| fired.push((h, v)));
+        assert!(fired.is_empty());
     }
 
     #[test]
     fn cancel_prevents_fire() {
         let mut w = wheel_u32(2);
-        let h = w.schedule(Duration::<Millis>::new(0), 42).unwrap();
+        let h = w.schedule(Duration::<TestUnit>::new(0), 42).unwrap();
         assert!(w.cancel(h));
         let mut fired = Vec::new();
-        w.tick(Timestamp::<Millis>::new(1), |_, v| fired.push(v));
+        set_now(1);
+        w.tick(|_, v| fired.push(v));
         assert!(fired.is_empty());
     }
 
     #[test]
     fn stale_handle_rejected() {
         let mut w = wheel_u32(1);
-        let h1 = w.schedule(Duration::<Millis>::new(0), 1).unwrap();
-        w.tick(Timestamp::<Millis>::new(1), |_, _| {});
-        let h2 = w.schedule(Duration::<Millis>::new(0), 2).unwrap();
+        let h1 = w.schedule(Duration::<TestUnit>::new(0), 1).unwrap();
+        set_now(1);
+        w.tick(|_, _| {});
+        let h2 = w.schedule(Duration::<TestUnit>::new(0), 2).unwrap();
         assert_ne!(h1.generation, h2.generation);
         assert!(!w.cancel(h1));
         assert!(w.cancel(h2));
@@ -286,9 +304,12 @@ mod tests {
     #[test]
     fn capacity_exhaustion() {
         let mut w = wheel_u32(1);
-        let _ = w.schedule(Duration::<Millis>::new(0), 1).unwrap();
+        let _ = w.schedule(Duration::<TestUnit>::new(0), 1).unwrap();
         assert!(
-            w.schedule(Duration::<Millis>::new(0), 2).is_none(),
+            matches!(
+                w.schedule(Duration::<TestUnit>::new(0), 2),
+                Err(WheelError::Capacity)
+            ),
             "should fail when slab is full"
         );
     }
@@ -296,27 +317,24 @@ mod tests {
     #[test]
     fn pending_kept_until_due() {
         let mut w = wheel_u32(2);
-        let h = w.schedule(Duration::<Millis>::new(2), 99).unwrap();
-        let mut fired: Vec<(TimerHandle<(), u32>, u32)> = Vec::new();
-        w.tick(Timestamp::<Millis>::new(2), |handle, v| {
-            fired.push((handle, v))
-        });
+        let h = w.schedule(Duration::<TestUnit>::new(2), 99).unwrap();
+        let mut fired: Vec<(TimerHandle<u32>, u32)> = Vec::new();
+        set_now(1);
+        w.tick(|handle, v| fired.push((handle, v)));
         assert!(fired.is_empty(), "not due yet");
-        w.tick(Timestamp::<Millis>::new(3), |handle, v| {
-            fired.push((handle, v))
-        });
-        assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].0, h);
-        assert_eq!(fired[0].1, 99);
+        set_now(2);
+        w.tick(|handle, v| fired.push((handle, v)));
+        assert_eq!(fired, vec![(h, 99)]);
     }
 
     #[test]
     fn jump_ahead_fires_intermediate() {
         let mut w = wheel_u32(3);
-        let h1 = w.schedule(Duration::<Millis>::new(0), 1).unwrap();
-        let h2 = w.schedule(Duration::<Millis>::new(2), 3).unwrap();
+        let h1 = w.schedule(Duration::<TestUnit>::new(0), 1).unwrap();
+        let h2 = w.schedule(Duration::<TestUnit>::new(2), 3).unwrap();
         let mut seen = Vec::new();
-        w.tick(Timestamp::<Millis>::new(3), |h, v| seen.push((h, v)));
+        set_now(3);
+        w.tick(|h, v| seen.push((h, v)));
         seen.sort_by_key(|(_, v)| *v);
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], (h1, 1));
