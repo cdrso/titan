@@ -1,12 +1,9 @@
 //! Shared types for data-plane identifiers and sequencing.
-//!
-//! Channels are typed streams (one type per channel). Sequence numbers are u64
-//! for wrap-safety. Timestamps are monotonic ticks aligned with the runtime timer unit.
 
 use serde::{Deserialize, Serialize};
 
 use crate::control::types::ChannelId;
-use crate::runtime::timing::time::{Micros, Timestamp};
+use crate::runtime::timing::{Micros, MonoInstant};
 
 /// Sequence number for data frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -37,7 +34,7 @@ impl SeqNum {
 }
 
 /// Monotonic timestamp in microseconds for on-wire RTT/liveness.
-pub type MonoTimestamp = Timestamp<Micros>;
+pub type MonoTimestamp = MonoInstant<Micros>;
 
 /// Alias re-export for convenience.
 pub type DataChannelId = ChannelId;
