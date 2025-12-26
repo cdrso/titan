@@ -1,0 +1,34 @@
+error[E0521]: borrowed data escapes outside of closure
+  --> tests/ui/wheel_cross_brand.rs:29:21
+   |
+22 |         let now_a = wheel_a.now();
+   |             ----- `now_a` declared here, outside of the closure body
+23 |         with_guard(|guard_b| {
+   |                     ------- `guard_b` is a reference that is only valid in the closure body
+...
+29 |             let _ = wheel_b.schedule_after(&now_a, Duration::<Micros>::new(1), 7);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `guard_b` escapes the closure body here
+   |
+   = note: requirement occurs because of the type `WheelInstant<'_, Micros>`, which makes the generic argument `'_` invariant
+   = note: the struct `WheelInstant<'id, U>` is invariant over the parameter `'id`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error[E0521]: borrowed data escapes outside of closure
+  --> tests/ui/wheel_cross_brand.rs:24:43
+   |
+16 |       with_guard(|guard_a| {
+   |                   -------
+   |                   |
+   |                   `guard_a` is a reference that is only valid in the closure body
+   |                   has type `Guard<'1>`
+...
+24 |               let mut wheel_b: Wheel8<'_> = Wheel::new(
+   |  ___________________________________________^
+25 | |                 guard_b,
+26 | |                 NonZeroDuration::new(NonZeroU64::new(1).unwrap()),
+27 | |                 NonZeroUsize::new(4).unwrap(),
+28 | |             );
+   | |             ^
+   | |             |
+   | |_____________`guard_a` escapes the closure body here
+   |               argument requires that `'1` must outlive `'static`

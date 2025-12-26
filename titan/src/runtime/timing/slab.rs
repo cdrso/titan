@@ -3,13 +3,14 @@
 use core::marker::PhantomData;
 use core::num::NonZeroUsize;
 
+use crate::runtime::timing::tick::TickInstant;
+
 /// Newtype for slab indices to prevent cross-slab misuse.
-// Manual Copy/Clone: derive would require T: Copy, but PhantomData is just a marker.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SlabIndex<T>(u32, PhantomData<T>);
 
+// Manual Copy/Clone: derive would require T: Copy, but PhantomData is just a marker.
 impl<T> Copy for SlabIndex<T> {}
-
 impl<T> Clone for SlabIndex<T> {
     fn clone(&self) -> Self {
         *self
@@ -47,9 +48,8 @@ pub struct Node<T> {
     pub next: Option<SlabIndex<T>>,
     /// Prev pointer in the per-slot timer list (None for head).
     pub prev: Option<SlabIndex<T>>,
-    /// Absolute deadline in wheel ticks.
-    // TODO check if we need typed time units here like we use elsewhere
-    pub deadline: u64,
+    /// Absolute deadline in wheel tick space.
+    pub deadline: TickInstant,
 }
 
 /// Metadata for a free slab slot.
@@ -86,9 +86,7 @@ impl<T> Slab<T> {
         let entries: Vec<_> = (0..capacity)
             .map(|i| {
                 let next = if i + 1 < capacity {
-                    // Safe: panics documented above if capacity > u32::MAX
                     Some(SlabIndex::from(
-                        // TODO parse dont validate?
                         u32::try_from(i + 1).expect("capacity should not exceed u32::MAX"),
                     ))
                 } else {
@@ -108,7 +106,11 @@ impl<T> Slab<T> {
     }
 
     /// Allocates a new node, returning its index and mutable ref.
-    pub fn alloc(&mut self, payload: T, deadline: u64) -> Option<(SlabIndex<T>, &mut Node<T>)> {
+    pub fn alloc(
+        &mut self,
+        payload: T,
+        deadline: TickInstant,
+    ) -> Option<(SlabIndex<T>, &mut Node<T>)> {
         let head = self.free_head?;
         let (next_free, generation) = match &self.entries[usize::from(head)] {
             Entry::Free(slot) => (slot.next, slot.generation),

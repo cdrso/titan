@@ -30,6 +30,8 @@ impl TimeUnit for Micros {
 }
 
 impl Now for Micros {
+    // 2^64 microseconds is ~584k years; truncation is effectively unreachable.
+    #[allow(clippy::cast_possible_truncation)]
     fn now() -> MonoInstant<Self> {
         let dur = monotonic_since_start();
         MonoInstant::new(dur.as_micros() as u64)
@@ -45,6 +47,8 @@ impl TimeUnit for Millis {
 }
 
 impl Now for Millis {
+    // 2^64 milliseconds is ~584 million years; truncation is effectively unreachable.
+    #[allow(clippy::cast_possible_truncation)]
     fn now() -> MonoInstant<Self> {
         let dur = monotonic_since_start();
         MonoInstant::new(dur.as_millis() as u64)
@@ -169,13 +173,12 @@ impl TryFrom<StdDuration> for Duration<Seconds> {
 pub struct ZeroDurationError;
 
 /// Non-zero strongly-typed duration in a given unit.
-// Manual Copy/Clone: derive would require U: Copy, but PhantomData is just a marker.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct NonZeroDuration<U: TimeUnit>(NonZeroU64, PhantomData<U>);
 
+// Manual Copy/Clone: derive would require U: Copy, but PhantomData is just a marker.
 impl<U: TimeUnit> Copy for NonZeroDuration<U> {}
-
 impl<U: TimeUnit> Clone for NonZeroDuration<U> {
     fn clone(&self) -> Self {
         *self
@@ -214,7 +217,6 @@ impl<U: TimeUnit> TryFrom<u64> for NonZeroDuration<U> {
 pub struct MonoInstant<U: TimeUnit>(u64, PhantomData<U>);
 
 impl<U: TimeUnit> Copy for MonoInstant<U> {}
-
 impl<U: TimeUnit> Clone for MonoInstant<U> {
     fn clone(&self) -> Self {
         *self
