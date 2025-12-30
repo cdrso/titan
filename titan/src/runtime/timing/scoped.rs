@@ -36,19 +36,17 @@ where
         delay: Duration<U>,
         payload: T,
     ) -> Result<TimerHandle<'id, T, U>, WheelError> {
-        let now = self.inner.now();
-        self.inner.schedule_after(&now, delay, payload)
+        self.inner.schedule_after(U::now(), delay, payload)
     }
 
     /// Schedules `payload` to fire after `delay` from an explicit instant.
-    pub fn schedule_after_at(
+    pub fn schedule_at(
         &mut self,
         now: MonoInstant<U>,
         delay: Duration<U>,
         payload: T,
     ) -> Result<TimerHandle<'id, T, U>, WheelError> {
-        let now = self.inner.tick_from_instant(now);
-        self.inner.schedule_after(&now, delay, payload)
+        self.inner.schedule_after(now, delay, payload)
     }
 
     /// Cancels a timer by handle.
@@ -58,14 +56,12 @@ where
 
     /// Advances the wheel to `now` and fires any due timers.
     pub fn tick_at(&mut self, now: MonoInstant<U>, on_fire: impl FnMut(TimerHandle<'id, T, U>, T)) {
-        let now = self.inner.tick_from_instant(now);
-        self.inner.tick_at(&now, on_fire);
+        self.inner.tick_at(now, on_fire);
     }
 
     /// Advances the wheel to the current time and fires any due timers.
     pub fn tick_now(&mut self, on_fire: impl FnMut(TimerHandle<'id, T, U>, T)) {
-        let now = self.inner.now();
-        self.inner.tick_at(&now, on_fire);
+        self.inner.tick_at(U::now(), on_fire);
     }
 }
 
@@ -176,11 +172,11 @@ mod tests {
     }
 
     #[test]
-    fn schedule_after_at_and_tick_at_use_explicit_instants() {
+    fn schedule_at_and_tick_at_use_explicit_instants() {
         set_now(0);
         with_test_wheel::<u32, 8, _>(4, |wheel| {
             let now = MonoInstant::new(3);
-            let handle = wheel.schedule_after_at(now, Duration::new(2), 5).unwrap();
+            let handle = wheel.schedule_at(now, Duration::new(2), 5).unwrap();
             let mut fired = Vec::new();
 
             wheel.tick_at(MonoInstant::new(4), |h, payload| fired.push((h, payload)));
@@ -192,14 +188,14 @@ mod tests {
     }
 
     #[test]
-    fn schedule_after_at_uses_cursor_when_now_behind() {
+    fn schedule_at_uses_cursor_when_now_behind() {
         set_now(0);
         with_test_wheel::<u32, 8, _>(4, |wheel| {
             set_now(5);
             wheel.tick_now(|_, _| {});
 
             let handle = wheel
-                .schedule_after_at(MonoInstant::new(3), Duration::new(1), 9)
+                .schedule_at(MonoInstant::new(3), Duration::new(1), 9)
                 .unwrap();
             let mut fired = Vec::new();
 

@@ -76,7 +76,6 @@ impl Now for Seconds {
 pub struct Duration<U: TimeUnit>(u64, PhantomData<U>);
 
 impl<U: TimeUnit> Copy for Duration<U> {}
-
 impl<U: TimeUnit> Clone for Duration<U> {
     fn clone(&self) -> Self {
         *self
@@ -160,10 +159,9 @@ impl TryFrom<StdDuration> for Duration<Millis> {
     }
 }
 
-impl TryFrom<StdDuration> for Duration<Seconds> {
-    type Error = TryFromIntError;
-    fn try_from(d: StdDuration) -> Result<Self, Self::Error> {
-        Ok(Self::new(d.as_secs()))
+impl From<StdDuration> for Duration<Seconds> {
+    fn from(d: StdDuration) -> Self {
+        Self::new(d.as_secs())
     }
 }
 
@@ -177,7 +175,6 @@ pub struct ZeroDurationError;
 #[repr(transparent)]
 pub struct NonZeroDuration<U: TimeUnit>(NonZeroU64, PhantomData<U>);
 
-// Manual Copy/Clone: derive would require U: Copy, but PhantomData is just a marker.
 impl<U: TimeUnit> Copy for NonZeroDuration<U> {}
 impl<U: TimeUnit> Clone for NonZeroDuration<U> {
     fn clone(&self) -> Self {

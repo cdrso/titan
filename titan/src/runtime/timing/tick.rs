@@ -8,7 +8,7 @@
 use core::ops::Add;
 
 /// A point on the discrete tick lattice.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct TickInstant(u64);
 
@@ -40,7 +40,7 @@ impl TickInstant {
 }
 
 /// A span in tick space (number of ticks).
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct TickSpan(u64);
 

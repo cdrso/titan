@@ -16,15 +16,6 @@ use crate::runtime::timing::slab::{Slab, SlabIndex};
 use crate::runtime::timing::tick::{TickInstant, TickSpan};
 use crate::runtime::timing::time::{Duration, MonoInstant, NonZeroDuration, Now, TimeUnit};
 
-/// Branded wheel instant for a specific wheel instance and time unit.
-/// Represents a point on the wheel's discrete tick lattice.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
-pub struct WheelInstant<'id, U: TimeUnit> {
-    tick_instant: TickInstant,
-    _brand: Id<'id>,
-    _unit: PhantomData<U>,
-}
-
 /// Handle returned to callers; includes index and generation to detect stale use.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct TimerHandle<'id, T, U: TimeUnit> {
@@ -68,17 +59,12 @@ where
 {
     const _ASSERT_SLOTS: () = assert!(SLOTS >= 2);
 
-    /// Converts a monotonic instant into a branded wheel tick instant.
+    /// Converts a monotonic instant into a wheel-local tick.
     #[inline]
-    #[must_use]
-    pub fn tick_from_instant(&self, instant: MonoInstant<U>) -> WheelInstant<'id, U> {
+    fn tick_from_instant(&self, instant: MonoInstant<U>) -> TickInstant {
         let elapsed = instant - self.start;
-        let now_tick = elapsed / Duration::from(self.tick_duration); // dimensionless tick count
-        WheelInstant {
-            tick_instant: TickInstant::new(now_tick),
-            _brand: self.brand,
-            _unit: PhantomData,
-        }
+        let now_tick = elapsed / Duration::from(self.tick_duration);
+        TickInstant::new(now_tick)
     }
 
     /// Maximum delay (in ticks) that can be scheduled.
@@ -104,10 +90,11 @@ where
     /// Returns an error if the delay exceeds the wheel's range or the slab is at capacity.
     pub fn schedule_after(
         &mut self,
-        now: &WheelInstant<'id, U>,
+        now: MonoInstant<U>,
         delay: Duration<U>,
         payload: T,
     ) -> Result<TimerHandle<'id, T, U>, WheelError> {
+        let now_tick = self.tick_from_instant(now);
         let ticks_needed = delay.div_ceil(Duration::from(self.tick_duration));
         let ticks_ahead = TickSpan::new(ticks_needed.max(1));
         let max_delay = self.max_tick_span();
@@ -117,7 +104,7 @@ where
                 max: max_delay.get(),
             });
         }
-        let base_tick = core::cmp::max(self.cursor, now.tick_instant);
+        let base_tick = core::cmp::max(self.cursor, now_tick);
         // Adding ticks is assumed not to overflow; see TickInstant::add_span.
         let deadline = base_tick + ticks_ahead;
 
@@ -190,10 +177,10 @@ where
     /// `on_fire` receives the handle (for callers that stash it) and the payload by value.
     pub fn tick_at(
         &mut self,
-        now: &WheelInstant<'id, U>,
+        now: MonoInstant<U>,
         mut on_fire: impl FnMut(TimerHandle<'id, T, U>, T),
     ) {
-        let now_tick = now.tick_instant;
+        let now_tick = self.tick_from_instant(now);
         if now_tick <= self.cursor {
             return;
         }
@@ -249,13 +236,6 @@ where
             brand,
         }
     }
-
-    /// Returns a branded "now" token for this wheel instance.
-    #[inline]
-    #[must_use]
-    pub fn now(&self) -> WheelInstant<'id, U> {
-        self.tick_from_instant(U::now())
-    }
 }
 
 #[cfg(test)]
@@ -289,6 +269,10 @@ mod tests {
         NOW.with(|t| t.set(v));
     }
 
+    fn now() -> MonoInstant<TestUnit> {
+        TestUnit::now()
+    }
+
     type TestWheel<'id> = Wheel<'id, u32, TestUnit, 8>;
     type StressWheel<'id> = Wheel<'id, u32, TestUnit, 16>;
 
@@ -305,24 +289,21 @@ mod tests {
     fn fires_due_timers_no_alloc() {
         generativity::make_guard!(guard);
         let mut w = wheel_u32(guard, 4);
-        let now = w.now();
         let h1 = w
-            .schedule_after(&now, Duration::<TestUnit>::new(0), 10)
+            .schedule_after(now(), Duration::<TestUnit>::new(0), 10)
             .unwrap();
         let h2 = w
-            .schedule_after(&now, Duration::<TestUnit>::new(1), 20)
+            .schedule_after(now(), Duration::<TestUnit>::new(1), 20)
             .unwrap();
         let mut fired = Vec::new();
         set_now(1);
-        let now = w.now();
-        w.tick_at(&now, |h, v| fired.push((h, v)));
+        w.tick_at(now(), |h, v| fired.push((h, v)));
         fired.sort_by_key(|(_, v)| *v);
         assert_eq!(fired, vec![(h1, 10), (h2, 20)]);
 
         fired.clear();
         set_now(3);
-        let now = w.now();
-        w.tick_at(&now, |h, v| fired.push((h, v)));
+        w.tick_at(now(), |h, v| fired.push((h, v)));
         assert!(fired.is_empty());
     }
 
@@ -330,15 +311,13 @@ mod tests {
     fn cancel_prevents_fire() {
         generativity::make_guard!(guard);
         let mut w = wheel_u32(guard, 2);
-        let now = w.now();
         let h = w
-            .schedule_after(&now, Duration::<TestUnit>::new(0), 42)
+            .schedule_after(now(), Duration::<TestUnit>::new(0), 42)
             .unwrap();
         assert!(w.cancel(&h));
         let mut fired = Vec::new();
         set_now(1);
-        let now = w.now();
-        w.tick_at(&now, |_, v| fired.push(v));
+        w.tick_at(now(), |_, v| fired.push(v));
         assert!(fired.is_empty());
     }
 
@@ -346,16 +325,13 @@ mod tests {
     fn stale_handle_rejected() {
         generativity::make_guard!(guard);
         let mut w = wheel_u32(guard, 1);
-        let now = w.now();
         let h1 = w
-            .schedule_after(&now, Duration::<TestUnit>::new(0), 1)
+            .schedule_after(now(), Duration::<TestUnit>::new(0), 1)
             .unwrap();
         set_now(1);
-        let now = w.now();
-        w.tick_at(&now, |_, _| {});
-        let now = w.now();
+        w.tick_at(now(), |_, _| {});
         let h2 = w
-            .schedule_after(&now, Duration::<TestUnit>::new(0), 2)
+            .schedule_after(now(), Duration::<TestUnit>::new(0), 2)
             .unwrap();
         assert_ne!(h1.generation, h2.generation);
         assert!(!w.cancel(&h1));
@@ -366,13 +342,12 @@ mod tests {
     fn capacity_exhaustion() {
         generativity::make_guard!(guard);
         let mut w = wheel_u32(guard, 1);
-        let now = w.now();
         let _ = w
-            .schedule_after(&now, Duration::<TestUnit>::new(0), 1)
+            .schedule_after(now(), Duration::<TestUnit>::new(0), 1)
             .unwrap();
         assert!(
             matches!(
-                w.schedule_after(&now, Duration::<TestUnit>::new(0), 2),
+                w.schedule_after(now(), Duration::<TestUnit>::new(0), 2),
                 Err(WheelError::Capacity)
             ),
             "should fail when slab is full"
@@ -383,10 +358,9 @@ mod tests {
     fn delay_too_long_rejected() {
         generativity::make_guard!(guard);
         let mut w = wheel_u32(guard, 1);
-        let now = w.now();
         let max = w.max_tick_span();
         let too_long = Duration::<TestUnit>::new(max.get() + 1);
-        let err = w.schedule_after(&now, too_long, 1);
+        let err = w.schedule_after(now(), too_long, 1);
         assert!(
             matches!(err, Err(WheelError::DelayTooLong { delay, max: got_max }) if delay == max.get() + 1 && got_max == max.get()),
             "should reject delays beyond one rotation"
@@ -398,17 +372,14 @@ mod tests {
         generativity::make_guard!(guard);
         let mut w = wheel_u32(guard, 2);
         set_now(2);
-        let now = w.now();
         let h = w
-            .schedule_after(&now, Duration::<TestUnit>::new(0), 11)
+            .schedule_after(now(), Duration::<TestUnit>::new(0), 11)
             .unwrap();
         let mut fired = Vec::new();
-        let now = w.now();
-        w.tick_at(&now, |handle, v| fired.push((handle, v)));
+        w.tick_at(now(), |handle, v| fired.push((handle, v)));
         assert!(fired.is_empty(), "should not fire before deadline");
         set_now(3);
-        let now = w.now();
-        w.tick_at(&now, |handle, v| fired.push((handle, v)));
+        w.tick_at(now(), |handle, v| fired.push((handle, v)));
         assert_eq!(fired, vec![(h, 11)]);
     }
 
@@ -416,23 +387,20 @@ mod tests {
     fn stale_now_uses_cursor() {
         generativity::make_guard!(guard);
         let mut w = wheel_u32(guard, 2);
-        let stale_now = w.now();
+        let stale_now = now();
         set_now(2);
-        let now = w.now();
-        w.tick_at(&now, |_, _| {});
+        w.tick_at(now(), |_, _| {});
         let h = w
-            .schedule_after(&stale_now, Duration::<TestUnit>::new(0), 5)
+            .schedule_after(stale_now, Duration::<TestUnit>::new(0), 5)
             .unwrap();
         let mut fired = Vec::new();
-        let now = w.now();
-        w.tick_at(&now, |handle, v| fired.push((handle, v)));
+        w.tick_at(now(), |handle, v| fired.push((handle, v)));
         assert!(
             fired.is_empty(),
             "stale now should not schedule in the past"
         );
         set_now(3);
-        let now = w.now();
-        w.tick_at(&now, |handle, v| fired.push((handle, v)));
+        w.tick_at(now(), |handle, v| fired.push((handle, v)));
         assert_eq!(fired, vec![(h, 5)]);
     }
 
@@ -440,18 +408,16 @@ mod tests {
     fn cancel_non_head_removes_timer() {
         generativity::make_guard!(guard);
         let mut w = wheel_u32(guard, 2);
-        let now = w.now();
         let h1 = w
-            .schedule_after(&now, Duration::<TestUnit>::new(1), 1)
+            .schedule_after(now(), Duration::<TestUnit>::new(1), 1)
             .unwrap();
         let h2 = w
-            .schedule_after(&now, Duration::<TestUnit>::new(1), 2)
+            .schedule_after(now(), Duration::<TestUnit>::new(1), 2)
             .unwrap();
         assert!(w.cancel(&h1));
         let mut fired = Vec::new();
         set_now(1);
-        let now = w.now();
-        w.tick_at(&now, |handle, v| fired.push((handle, v)));
+        w.tick_at(now(), |handle, v| fired.push((handle, v)));
         assert_eq!(fired, vec![(h2, 2)]);
     }
 
@@ -459,18 +425,15 @@ mod tests {
     fn pending_kept_until_due() {
         generativity::make_guard!(guard);
         let mut w = wheel_u32(guard, 2);
-        let now = w.now();
         let h = w
-            .schedule_after(&now, Duration::<TestUnit>::new(2), 99)
+            .schedule_after(now(), Duration::<TestUnit>::new(2), 99)
             .unwrap();
         let mut fired = Vec::new();
         set_now(1);
-        let now = w.now();
-        w.tick_at(&now, |handle, v| fired.push((handle, v)));
+        w.tick_at(now(), |handle, v| fired.push((handle, v)));
         assert!(fired.is_empty(), "not due yet");
         set_now(2);
-        let now = w.now();
-        w.tick_at(&now, |handle, v| fired.push((handle, v)));
+        w.tick_at(now(), |handle, v| fired.push((handle, v)));
         assert_eq!(fired, vec![(h, 99)]);
     }
 
@@ -478,17 +441,15 @@ mod tests {
     fn jump_ahead_fires_intermediate() {
         generativity::make_guard!(guard);
         let mut w = wheel_u32(guard, 3);
-        let now = w.now();
         let h1 = w
-            .schedule_after(&now, Duration::<TestUnit>::new(0), 1)
+            .schedule_after(now(), Duration::<TestUnit>::new(0), 1)
             .unwrap();
         let h2 = w
-            .schedule_after(&now, Duration::<TestUnit>::new(2), 3)
+            .schedule_after(now(), Duration::<TestUnit>::new(2), 3)
             .unwrap();
         let mut seen = Vec::new();
         set_now(3);
-        let now = w.now();
-        w.tick_at(&now, |h, v| seen.push((h, v)));
+        w.tick_at(now(), |h, v| seen.push((h, v)));
         seen.sort_by_key(|(_, v)| *v);
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], (h1, 1));
@@ -505,34 +466,30 @@ mod tests {
             NonZeroDuration::<TestUnit>::new(NonZeroU64::new(TICK_DURATION).unwrap()),
             NonZeroUsize::new(8).unwrap(),
         );
-        let now = w.now();
         let h1 = w
-            .schedule_after(&now, Duration::<TestUnit>::new(1), 1)
+            .schedule_after(now(), Duration::<TestUnit>::new(1), 1)
             .unwrap();
         let h2 = w
-            .schedule_after(&now, Duration::<TestUnit>::new(5), 2)
+            .schedule_after(now(), Duration::<TestUnit>::new(5), 2)
             .unwrap();
         let h3 = w
-            .schedule_after(&now, Duration::<TestUnit>::new(6), 3)
+            .schedule_after(now(), Duration::<TestUnit>::new(6), 3)
             .unwrap();
 
         let mut fired = Vec::new();
         set_now(4);
-        let now = w.now();
-        w.tick_at(&now, |handle, v| fired.push((handle, v)));
+        w.tick_at(now(), |handle, v| fired.push((handle, v)));
         assert!(fired.is_empty(), "no timers should fire before tick 1");
 
         fired.clear();
         set_now(5);
-        let now = w.now();
-        w.tick_at(&now, |handle, v| fired.push((handle, v)));
+        w.tick_at(now(), |handle, v| fired.push((handle, v)));
         fired.sort_by_key(|(_, v)| *v);
         assert_eq!(fired, vec![(h1, 1), (h2, 2)]);
 
         fired.clear();
         set_now(10);
-        let now = w.now();
-        w.tick_at(&now, |handle, v| fired.push((handle, v)));
+        w.tick_at(now(), |handle, v| fired.push((handle, v)));
         assert_eq!(fired, vec![(h3, 3)]);
     }
 
@@ -554,16 +511,19 @@ mod tests {
         let mut now_units: u64 = 0;
         let max_delay_units = (StressWheel::max_tick_span(&w).get()) * TICK_DURATION;
 
+        // Helper to convert time units to tick instant (mirrors wheel logic).
+        let to_tick = |units: u64| TickInstant::new(units / TICK_DURATION);
+
         for step in 0..STEPS {
             let action = rng.random_range(0..100);
             if action < 50 {
                 let delay = rng.random_range(0..=max_delay_units);
-                let now = w.now();
-                match w.schedule_after(&now, Duration::<TestUnit>::new(delay), step as u32) {
+                let now_tick = to_tick(now_units);
+                match w.schedule_after(now(), Duration::<TestUnit>::new(delay), step as u32) {
                     Ok(handle) => {
                         let ticks_needed = (delay + TICK_DURATION - 1) / TICK_DURATION;
                         let ticks_ahead = ticks_needed.max(1);
-                        let base_tick = core::cmp::max(model_cursor, now.tick_instant);
+                        let base_tick = core::cmp::max(model_cursor, now_tick);
                         let deadline = base_tick + TickSpan::new(ticks_ahead);
                         model.insert(handle.clone(), deadline);
                         handles.push(handle);
@@ -583,11 +543,10 @@ mod tests {
                 let advance = rng.random_range(0..=20);
                 now_units = now_units.saturating_add(advance);
                 set_now(now_units);
-                let now = w.now();
-                let now_tick = now.tick_instant;
+                let now_tick = to_tick(now_units);
 
                 let mut fired = Vec::new();
-                w.tick_at(&now, |handle, _| fired.push(handle));
+                w.tick_at(now(), |handle, _| fired.push(handle));
 
                 if now_tick <= model_cursor {
                     assert!(

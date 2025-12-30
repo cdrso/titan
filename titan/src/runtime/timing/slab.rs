@@ -24,13 +24,6 @@ impl<T> From<u32> for SlabIndex<T> {
     }
 }
 
-impl<T> From<SlabIndex<T>> for u32 {
-    #[inline]
-    fn from(idx: SlabIndex<T>) -> Self {
-        idx.0
-    }
-}
-
 impl<T> From<SlabIndex<T>> for usize {
     #[inline]
     fn from(idx: SlabIndex<T>) -> Self {
