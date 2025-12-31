@@ -3,6 +3,7 @@
 use crate::SharedMemorySafe;
 use crate::ipc::shmem::{Creator, Opener, ShmError, ShmMode, ShmPath};
 use crate::ipc::spsc::{Consumer, Producer};
+use std::fmt;
 use std::time::Duration;
 use thiserror::Error;
 use type_hash::TypeHash;
@@ -91,6 +92,12 @@ impl ClientId {
     }
 }
 
+impl fmt::Display for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{:04x}", self.pid, self.nonce)
+    }
+}
+
 /// Initial handshake message sent by client on connection.
 #[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -125,6 +132,12 @@ impl From<ChannelId> for u32 {
     }
 }
 
+impl fmt::Display for ChannelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Unique identifier for a data message type
 #[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -144,6 +157,18 @@ impl From<TypeId> for u64 {
     }
 }
 
+impl From<u64> for TypeId {
+    fn from(v: u64) -> Self {
+        Self(v)
+    }
+}
+
+impl fmt::Display for TypeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
 /// Commands sent from client to driver during an active session.
 #[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -156,8 +181,52 @@ pub enum ClientCommand {
     OpenTx { channel: ChannelId, type_id: TypeId },
     /// Request a new receive channel (driver -> client).
     OpenRx { channel: ChannelId, type_id: TypeId },
+    /// Subscribe to a remote publisher's channel.
+    ///
+    /// The driver will send a SETUP frame to the remote endpoint and
+    /// await SETUP_ACK/NAK. On success, DATA frames from the remote
+    /// publisher will be routed to the client's RX queue.
+    SubscribeRemote {
+        /// Local channel ID for this subscription.
+        channel: ChannelId,
+        /// Expected message type (must match publisher).
+        type_id: TypeId,
+        /// Remote driver's endpoint.
+        remote: RemoteEndpoint,
+        /// Remote channel ID on the publisher.
+        remote_channel: ChannelId,
+    },
     /// Close an existing channel.
     CloseChannel(ChannelId),
+}
+
+/// Remote endpoint representation for IPC (must be SharedMemorySafe).
+///
+/// We store the raw bytes of a socket address since SocketAddr isn't repr(C).
+#[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct RemoteEndpoint {
+    /// IPv4 address bytes (a.b.c.d).
+    pub addr: [u8; 4],
+    /// Port number.
+    pub port: u16,
+}
+
+impl RemoteEndpoint {
+    /// Creates a new remote endpoint from IPv4 octets and port.
+    #[must_use]
+    pub const fn new(a: u8, b: u8, c: u8, d: u8, port: u16) -> Self {
+        Self {
+            addr: [a, b, c, d],
+            port,
+        }
+    }
+
+    /// Creates a localhost endpoint on the given port.
+    #[must_use]
+    pub const fn localhost(port: u16) -> Self {
+        Self::new(127, 0, 0, 1, port)
+    }
 }
 
 /// Messages sent from client to driver.
@@ -208,6 +277,31 @@ pub enum DriverMessage {
     ChannelError(ChannelId),
     /// Data channel closed/acknowledged.
     ChannelClosed(ChannelId),
+    /// Remote subscription established successfully.
+    SubscriptionReady(ChannelId),
+    /// Remote subscription failed.
+    SubscriptionFailed {
+        /// The local channel that failed.
+        channel: ChannelId,
+        /// Reason for failure.
+        reason: SubscriptionFailure,
+    },
+}
+
+/// Reasons a remote subscription can fail.
+#[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SubscriptionFailure {
+    /// Remote publisher's type doesn't match.
+    TypeMismatch = 1,
+    /// Remote channel doesn't exist.
+    ChannelNotFound = 2,
+    /// Remote driver is at capacity.
+    CapacityExceeded = 3,
+    /// Network or protocol error.
+    NetworkError = 4,
+    /// Handshake timed out.
+    Timeout = 5,
 }
 
 /// Errors that can occur during connection establishment or communication.

@@ -227,6 +227,13 @@ impl<U: TimeUnit> MonoInstant<U> {
     pub const fn new(value: u64) -> Self {
         Self(value, PhantomData)
     }
+
+    /// Returns the raw units value.
+    #[inline]
+    #[must_use]
+    pub const fn units(self) -> u64 {
+        self.0
+    }
 }
 
 impl<U: TimeUnit> Add<Duration<U>> for MonoInstant<U> {

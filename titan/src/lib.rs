@@ -4,7 +4,14 @@ extern crate self as titan;
 pub mod control;
 pub mod data;
 pub mod ipc;
+mod mpsc;
+pub mod net;
 pub mod runtime;
+mod spsc;
+pub mod sync;
+mod trace;
+
+pub use trace::init_tracing;
 
 #[doc(inline)]
 pub use titan_derive::SharedMemorySafe;

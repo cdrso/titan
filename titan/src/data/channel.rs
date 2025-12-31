@@ -5,6 +5,7 @@
 use crate::data::{Frame, FrameError, Wire};
 use crate::ipc::shmem::{ShmError, ShmMode};
 use crate::ipc::spsc::{Consumer as SpscConsumer, Producer as SpscProducer, Timeout};
+use crate::trace::trace;
 use thiserror::Error;
 
 /// Errors that can occur when sending/receiving typed messages.
@@ -66,6 +67,11 @@ impl<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode>
     pub fn send(&self, msg: &T) -> Result<(), TypedChannelError> {
         let mut frame = Frame::new();
         frame.encode(msg).map_err(TypedChannelError::Frame)?;
+        trace!(
+            msg_type = std::any::type_name::<T>(),
+            frame_len = frame.len(),
+            "shm queue TX: sending message"
+        );
         self.producer
             .push(frame)
             .map_err(|_| TypedChannelError::QueueFull)
@@ -80,6 +86,11 @@ impl<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode>
     pub fn send_blocking(&self, msg: &T, timeout: Timeout) -> Result<(), TypedChannelError> {
         let mut frame = Frame::new();
         frame.encode(msg).map_err(TypedChannelError::Frame)?;
+        trace!(
+            msg_type = std::any::type_name::<T>(),
+            frame_len = frame.len(),
+            "shm queue TX: sending message (blocking)"
+        );
         self.producer
             .push_blocking(frame, timeout)
             .map_err(|_| TypedChannelError::Timeout)
@@ -113,9 +124,14 @@ impl<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode>
     /// Returns `Some(Err)` if deserialization from frame fails.
     #[must_use]
     pub fn recv(&self) -> Option<Result<T, TypedChannelError>> {
-        self.consumer
-            .pop()
-            .map(|frame| frame.decode().map_err(TypedChannelError::Frame))
+        self.consumer.pop().map(|frame| {
+            trace!(
+                msg_type = std::any::type_name::<T>(),
+                frame_len = frame.len(),
+                "shm queue RX: received message"
+            );
+            frame.decode().map_err(TypedChannelError::Frame)
+        })
     }
 
     /// Receives a message, blocking until available.
@@ -124,9 +140,14 @@ impl<T: Wire, const FRAME_CAP: usize, const QUEUE_CAP: usize, Mode: ShmMode>
     /// Returns `Some(Err)` if deserialization from frame fails.
     #[must_use]
     pub fn recv_blocking(&self, timeout: Timeout) -> Option<Result<T, TypedChannelError>> {
-        self.consumer
-            .pop_blocking(timeout)
-            .map(|frame| frame.decode().map_err(TypedChannelError::Frame))
+        self.consumer.pop_blocking(timeout).map(|frame| {
+            trace!(
+                msg_type = std::any::type_name::<T>(),
+                frame_len = frame.len(),
+                "shm queue RX: received message (blocking)"
+            );
+            frame.decode().map_err(TypedChannelError::Frame)
+        })
     }
 }
 

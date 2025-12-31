@@ -5,8 +5,10 @@ use crate::control::types::{
     ControlConnection, DRIVER_INBOX_CAPACITY, DriverMessage, DriverRole, HELLO_TIMEOUT,
     control_channel_paths,
 };
+use crate::ipc::mpsc::Producer as MpscProducer;
 use crate::ipc::shmem::{Opener, ShmPath};
 use crate::ipc::spsc::{Consumer, Producer, Timeout};
+use crate::trace::{debug, info, warn};
 
 type ClientConn = ControlConnection<ClientRole>;
 type DriverConn = ControlConnection<DriverRole>;
@@ -23,6 +25,8 @@ pub fn client_connect(
     timeout: Timeout,
 ) -> Result<ClientConn, ConnectionError> {
     let id = ClientId::generate();
+    debug!(client_id = %id, inbox = %driver_inbox_path, "client connecting to driver");
+
     let (tx_path, rx_path) = control_channel_paths(&id);
 
     let tx = Producer::create(tx_path)?;
@@ -32,15 +36,26 @@ pub fn client_connect(
         .map_err(|_| ConnectionError::QueueFull)?;
 
     let driver_inbox =
-        Producer::<ClientId, DRIVER_INBOX_CAPACITY, Opener>::open(driver_inbox_path)?;
+        MpscProducer::<ClientId, DRIVER_INBOX_CAPACITY, Opener>::open(driver_inbox_path)?;
     driver_inbox
         .push(id)
         .map_err(|_| ConnectionError::QueueFull)?;
 
+    debug!(client_id = %id, "sent Hello, waiting for Welcome");
+
     match rx.pop_blocking(timeout) {
-        Some(DriverMessage::Welcome) => Ok(ControlConnection { id, tx, rx }),
-        Some(_) => Err(ConnectionError::ProtocolViolation),
-        None => Err(ConnectionError::Timeout),
+        Some(DriverMessage::Welcome) => {
+            info!(client_id = %id, "client connected successfully");
+            Ok(ControlConnection { id, tx, rx })
+        }
+        Some(msg) => {
+            warn!(client_id = %id, msg = ?msg, "unexpected message during handshake");
+            Err(ConnectionError::ProtocolViolation)
+        }
+        None => {
+            warn!(client_id = %id, "handshake timeout waiting for Welcome");
+            Err(ConnectionError::Timeout)
+        }
     }
 }
 
@@ -52,6 +67,8 @@ pub fn client_connect(
 /// - [`ConnectionError::QueueFull`] if the Welcome cannot be enqueued
 /// - [`ConnectionError::Shm`] for shared memory open failures
 pub fn driver_accept(client_id: ClientId) -> Result<DriverConn, ConnectionError> {
+    debug!(client_id = %client_id, "driver accepting client connection");
+
     let (client_tx_path, client_rx_path) = control_channel_paths(&client_id);
 
     let tx = Producer::<DriverMessage, CONTROL_QUEUE_CAPACITY, Opener>::open(client_rx_path)?;
@@ -62,13 +79,23 @@ pub fn driver_accept(client_id: ClientId) -> Result<DriverConn, ConnectionError>
         .pop_blocking(Timeout::Duration(HELLO_TIMEOUT))
         .map(ClientHello::try_from)
     {
-        Some(Ok(hello)) if hello.id == client_id => {}
-        Some(_) => return Err(ConnectionError::ProtocolViolation),
-        None => return Err(ConnectionError::Timeout),
+        Some(Ok(hello)) if hello.id == client_id => {
+            debug!(client_id = %client_id, "received valid Hello");
+        }
+        Some(_) => {
+            warn!(client_id = %client_id, "invalid Hello message");
+            return Err(ConnectionError::ProtocolViolation);
+        }
+        None => {
+            warn!(client_id = %client_id, "timeout waiting for Hello");
+            return Err(ConnectionError::Timeout);
+        }
     }
 
     tx.push(DriverMessage::Welcome)
         .map_err(|_| ConnectionError::QueueFull)?;
+
+    info!(client_id = %client_id, "client accepted");
 
     Ok(ControlConnection {
         id: client_id,
@@ -81,6 +108,7 @@ pub fn driver_accept(client_id: ClientId) -> Result<DriverConn, ConnectionError>
 mod tests {
     use super::*;
     use crate::control::types::driver_inbox_path;
+    use crate::ipc::mpsc::Consumer as MpscConsumer;
     use crate::ipc::shmem::Creator;
     use serial_test::serial;
     use std::thread;
@@ -99,10 +127,11 @@ mod tests {
     #[serial]
     fn handshake_success() {
         with_clean_inbox(|inbox_path| {
-            // Driver creates inbox
-            let driver_inbox =
-                Consumer::<ClientId, DRIVER_INBOX_CAPACITY, Creator>::create(inbox_path.clone())
-                    .unwrap();
+            // Driver creates inbox (MPSC - multiple clients can connect)
+            let driver_inbox = MpscConsumer::<ClientId, DRIVER_INBOX_CAPACITY, Creator>::create(
+                inbox_path.clone(),
+            )
+            .unwrap();
 
             let client_thread = thread::spawn(move || {
                 client_connect(inbox_path, Timeout::Duration(Duration::from_secs(1)))
@@ -125,9 +154,10 @@ mod tests {
     fn handshake_client_timeout_no_driver() {
         with_clean_inbox(|inbox_path| {
             // Create inbox but don't accept
-            let _driver_inbox =
-                Consumer::<ClientId, DRIVER_INBOX_CAPACITY, Creator>::create(inbox_path.clone())
-                    .unwrap();
+            let _driver_inbox = MpscConsumer::<ClientId, DRIVER_INBOX_CAPACITY, Creator>::create(
+                inbox_path.clone(),
+            )
+            .unwrap();
 
             let result = client_connect(inbox_path, Timeout::Duration(Duration::from_millis(50)));
 
@@ -167,9 +197,10 @@ mod tests {
     #[serial]
     fn handshake_bidirectional_communication() {
         with_clean_inbox(|inbox_path| {
-            let driver_inbox =
-                Consumer::<ClientId, DRIVER_INBOX_CAPACITY, Creator>::create(inbox_path.clone())
-                    .unwrap();
+            let driver_inbox = MpscConsumer::<ClientId, DRIVER_INBOX_CAPACITY, Creator>::create(
+                inbox_path.clone(),
+            )
+            .unwrap();
 
             let client_thread = thread::spawn(move || {
                 client_connect(inbox_path, Timeout::Duration(Duration::from_secs(1)))

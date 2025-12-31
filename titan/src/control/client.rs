@@ -3,11 +3,12 @@
 use crate::control::handshake::client_connect;
 use crate::control::types::{
     ChannelId, ClientCommand, ClientMessage, ClientRole, ConnectionError, ControlConnection,
-    DATA_QUEUE_CAPACITY, DriverMessage, TypeId, data_rx_path, data_tx_path,
+    DATA_QUEUE_CAPACITY, DriverMessage, RemoteEndpoint, TypeId, data_rx_path, data_tx_path,
 };
 use crate::data::{DEFAULT_FRAME_CAP, Frame, MessageReceiver, MessageSender, Wire};
 use crate::ipc::shmem::{Creator, ShmPath};
 use crate::ipc::spsc::{Consumer, Producer, Timeout};
+use crate::trace::{debug, info, warn};
 use minstant::Instant;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -82,6 +83,7 @@ impl Client {
     ///
     /// The disconnect command is best-effort (ignored if queue is full).
     pub fn disconnect(self) {
+        debug!(client_id = %self.control_conn.id, "client disconnecting");
         let _ = self
             .control_conn
             .tx
@@ -105,6 +107,14 @@ impl Client {
         timeout: Duration,
     ) -> Result<MessageSender<T, DEFAULT_FRAME_CAP, DATA_QUEUE_CAPACITY, Creator>, ConnectionError>
     {
+        let type_id = TypeId::of::<T>();
+        debug!(
+            client_id = %self.control_conn.id,
+            channel = %channel,
+            type_id = %type_id,
+            "opening TX data channel"
+        );
+
         let path = data_tx_path(&self.control_conn.id, channel);
         let queue_producer_raw =
             Producer::<Frame<DEFAULT_FRAME_CAP>, DATA_QUEUE_CAPACITY, Creator>::create(path)?;
@@ -113,11 +123,16 @@ impl Client {
             .tx
             .push(ClientMessage::Command(ClientCommand::OpenTx {
                 channel,
-                type_id: TypeId::of::<T>(),
+                type_id,
             }))
             .map_err(|_| ConnectionError::QueueFull)?;
 
         wait_for_ready(self, channel, timeout)?;
+        info!(
+            client_id = %self.control_conn.id,
+            channel = %channel,
+            "TX data channel ready"
+        );
         Ok(MessageSender::new(queue_producer_raw))
     }
 
@@ -138,6 +153,14 @@ impl Client {
         timeout: Duration,
     ) -> Result<MessageReceiver<T, DEFAULT_FRAME_CAP, DATA_QUEUE_CAPACITY, Creator>, ConnectionError>
     {
+        let type_id = TypeId::of::<T>();
+        debug!(
+            client_id = %self.control_conn.id,
+            channel = %channel,
+            type_id = %type_id,
+            "opening RX data channel"
+        );
+
         let queue_path = data_rx_path(&self.control_conn.id, channel);
         let queue_consumer_raw =
             Consumer::<Frame<DEFAULT_FRAME_CAP>, DATA_QUEUE_CAPACITY, Creator>::create(queue_path)?;
@@ -146,11 +169,16 @@ impl Client {
             .tx
             .push(ClientMessage::Command(ClientCommand::OpenRx {
                 channel,
-                type_id: TypeId::of::<T>(),
+                type_id,
             }))
             .map_err(|_| ConnectionError::QueueFull)?;
 
         wait_for_ready(self, channel, timeout)?;
+        info!(
+            client_id = %self.control_conn.id,
+            channel = %channel,
+            "RX data channel ready"
+        );
         Ok(MessageReceiver::new(queue_consumer_raw))
     }
 
@@ -163,6 +191,71 @@ impl Client {
             .tx
             .push(ClientMessage::Command(ClientCommand::CloseChannel(channel)))
             .map_err(|_| ConnectionError::QueueFull)
+    }
+
+    /// Subscribes to a remote publisher's channel.
+    ///
+    /// This creates a local RX queue, instructs the driver to send a SETUP
+    /// frame to the remote publisher, and waits for the subscription to be
+    /// established. On success, DATA frames from the remote publisher will
+    /// be delivered to the returned receiver.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel` - Local channel ID for this subscription.
+    /// * `remote` - Remote driver's endpoint (IP:port).
+    /// * `remote_channel` - Channel ID on the remote publisher.
+    /// * `timeout` - How long to wait for subscription establishment.
+    ///
+    /// # Errors
+    ///
+    /// - [`ConnectionError::Shm`] if the data queue cannot be created
+    /// - [`ConnectionError::QueueFull`] if the control queue is full
+    /// - [`ConnectionError::Timeout`] if subscription is not established in time
+    /// - [`ConnectionError::ProtocolViolation`] if the remote rejects (type mismatch, etc.)
+    pub fn subscribe_remote<T: Wire>(
+        &self,
+        channel: ChannelId,
+        remote: RemoteEndpoint,
+        remote_channel: ChannelId,
+        timeout: Duration,
+    ) -> Result<MessageReceiver<T, DEFAULT_FRAME_CAP, DATA_QUEUE_CAPACITY, Creator>, ConnectionError>
+    {
+        let type_id = TypeId::of::<T>();
+        info!(
+            client_id = %self.control_conn.id,
+            local_channel = %channel,
+            remote_addr = ?remote,
+            remote_channel = %remote_channel,
+            type_id = %type_id,
+            "subscribing to remote channel"
+        );
+
+        // Create the local RX queue first
+        let queue_path = data_rx_path(&self.control_conn.id, channel);
+        let queue_consumer_raw =
+            Consumer::<Frame<DEFAULT_FRAME_CAP>, DATA_QUEUE_CAPACITY, Creator>::create(queue_path)?;
+
+        // Tell driver to subscribe to remote
+        self.control_conn
+            .tx
+            .push(ClientMessage::Command(ClientCommand::SubscribeRemote {
+                channel,
+                type_id,
+                remote,
+                remote_channel,
+            }))
+            .map_err(|_| ConnectionError::QueueFull)?;
+
+        // Wait for subscription result
+        wait_for_subscription(self, channel, timeout)?;
+        info!(
+            client_id = %self.control_conn.id,
+            local_channel = %channel,
+            remote_channel = %remote_channel,
+            "remote subscription established"
+        );
+        Ok(MessageReceiver::new(queue_consumer_raw))
     }
 }
 
@@ -185,6 +278,35 @@ fn wait_for_ready(
         {
             Some(DriverMessage::ChannelReady(ch)) if ch == target => return Ok(()),
             Some(DriverMessage::ChannelError(ch)) if ch == target => {
+                return Err(ConnectionError::ProtocolViolation);
+            }
+            Some(other) => {
+                client.pending.borrow_mut().push_back(other);
+            }
+            None => return Err(ConnectionError::Timeout),
+        }
+    }
+}
+
+fn wait_for_subscription(
+    client: &Client,
+    target: ChannelId,
+    timeout: Duration,
+) -> Result<(), ConnectionError> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(ConnectionError::Timeout)?;
+
+        match client
+            .control_conn
+            .rx
+            .pop_blocking(Timeout::Duration(remaining))
+        {
+            Some(DriverMessage::SubscriptionReady(ch)) if ch == target => return Ok(()),
+            Some(DriverMessage::SubscriptionFailed { channel, reason: _ }) if channel == target => {
                 return Err(ConnectionError::ProtocolViolation);
             }
             Some(other) => {

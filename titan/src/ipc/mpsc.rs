@@ -1,52 +1,43 @@
-//! Lock-free SPSC queue over POSIX shared memory.
+//! Lock-free MPSC queue over POSIX shared memory.
 //!
-//! A wait-free bounded queue for cross-process communication using a ring buffer
-//! with atomic indices.
+//! A wait-free bounded queue for cross-process communication supporting
+//! multiple producers and a single consumer.
 //!
 //! # Overview
 //!
-//! - [`Producer`] - Write end (single producer per queue)
+//! - [`Producer`] - Write end (multiple producers allowed per queue)
 //! - [`Consumer`] - Read end (single consumer per queue)
 //! - Lock-free, wait-free: no mutexes or syscalls in the hot path
 //!
 //! # Example
 //!
 //! ```no_run
-//! use titan::ipc::spsc::{Producer, Consumer};
+//! use titan::ipc::mpsc::{Producer, Consumer};
 //! use titan::ipc::shmem::ShmPath;
 //!
-//! let path = ShmPath::new("/my-queue").unwrap();
+//! let path = ShmPath::new("/my-inbox").unwrap();
 //!
-//! // Process A: Create producer
-//! let producer = Producer::<u64, 1024, _>::create(path.clone())?;
-//! producer.push(42).expect("Queue full");
+//! // Daemon creates inbox (consumer)
+//! let consumer = Consumer::<u64, 1024, _>::create(path.clone())?;
 //!
-//! // Process B: Open consumer
-//! let consumer = Consumer::<u64, 1024, _>::open(path)?;
-//! assert_eq!(consumer.pop(), Some(42));
+//! // Clients open inbox (producers) - multiple allowed!
+//! let producer1 = Producer::<u64, 1024, _>::open(path.clone())?;
+//! let producer2 = Producer::<u64, 1024, _>::open(path)?;
+//!
+//! producer1.push(1).expect("Queue full");
+//! producer2.push(2).expect("Queue full");
+//!
+//! assert!(consumer.pop().is_some());
+//! assert!(consumer.pop().is_some());
 //! # Ok::<(), titan::ipc::shmem::ShmError>(())
 //! ```
 //!
-//! Either endpoint can be the [`Creator`] (unlinks on drop) or [`Opener`] (no unlink).
-//! See [`shmem`](super::shmem) for cleanup semantics.
+//! # Algorithm
 //!
-//! # Memory Layout
-//!
-//! ```text
-//! ┌────────────────────────────────────────┐
-//! │ InitMarker      (64-byte aligned)      │
-//! ├────────────────────────────────────────┤
-//! │ ProducerState   (head, cached_tail)    │
-//! ├────────────────────────────────────────┤
-//! │ ConsumerState   (tail, cached_head)    │
-//! ├────────────────────────────────────────┤
-//! │ Padding         (false sharing guard)  │
-//! ├────────────────────────────────────────┤
-//! │ Buffer: [Slot<T>; N]                   │
-//! ├────────────────────────────────────────┤
-//! │ Padding         (false sharing guard)  │
-//! └────────────────────────────────────────┘
-//! ```
+//! Uses per-slot sequence numbers for synchronization:
+//! - Producers atomically reserve positions via `fetch_add` on head
+//! - Each slot has a sequence number indicating its state
+//! - Consumer checks sequence before reading, updates after to release slot
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -57,7 +48,7 @@ use minstant::Instant;
 
 use super::shmem::{Creator, Opener, Shm, ShmError, ShmMode, ShmPath};
 use crate::SharedMemorySafe;
-use crate::spsc::ring::{ConsumerState, ProducerState, Ring, Slot, SpscCell};
+use crate::mpsc::ring::{ConsumerState, ProducerState, Ring, Slot};
 
 /// Timeout specification for blocking operations.
 #[derive(Debug, Clone, Copy)]
@@ -74,30 +65,25 @@ impl From<Duration> for Timeout {
     }
 }
 
-const INIT_MAGIC: u64 = 0x5350_5343_494E_4954; // "SPSCINIT" in ASCII
+const INIT_MAGIC: u64 = 0x4D50_5343_494E_4954; // "MPSCINIT" in ASCII
 const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 // SharedMemorySafe implementations for ring types
-// SAFETY: SpscCell can be placed in shared memory because:
-// - It's repr(transparent) around UnsafeCell<T> where T: SharedMemorySafe
-// - The Role phantom type doesn't affect memory layout
-// - Access safety is enforced by the SPSC protocol, not by the type system
-unsafe impl<T: SharedMemorySafe, Role> SharedMemorySafe for SpscCell<T, Role> {}
+// SAFETY: Slot can be placed in shared memory because:
+// - It's repr(C) with proper alignment
+// - seq is AtomicUsize (SharedMemorySafe)
+// - value is UnsafeCell<MaybeUninit<T>> where T: SharedMemorySafe
+unsafe impl<T: SharedMemorySafe> SharedMemorySafe for Slot<T> {}
 
 // SAFETY: ProducerState is SharedMemorySafe because:
 // - It's repr(C) with cache line alignment
-// - All fields are SharedMemorySafe (AtomicUsize, SpscCell<usize>)
+// - head is AtomicUsize (SharedMemorySafe)
 unsafe impl SharedMemorySafe for ProducerState {}
 
 // SAFETY: ConsumerState is SharedMemorySafe because:
 // - It's repr(C) with cache line alignment
-// - All fields are SharedMemorySafe (AtomicUsize, SpscCell<usize>)
+// - tail is AtomicUsize (SharedMemorySafe)
 unsafe impl SharedMemorySafe for ConsumerState {}
-
-// SAFETY: Slot is SharedMemorySafe because:
-// - It's repr(C)
-// - The value field is SpscCell<MaybeUninit<T>> where T: SharedMemorySafe
-unsafe impl<T: SharedMemorySafe> SharedMemorySafe for Slot<T> {}
 
 // SAFETY: Ring is SharedMemorySafe because:
 // - It's repr(C)
@@ -110,7 +96,7 @@ unsafe impl<T: SharedMemorySafe, const N: usize> SharedMemorySafe for Ring<T, N>
 #[repr(align(64))]
 struct InitMarker(AtomicU64);
 
-/// IPC-specific queue layout with init marker and trailing padding.
+/// IPC-specific queue layout with init marker.
 #[repr(C)]
 struct IpcQueue<T: SharedMemorySafe, const N: usize> {
     /// Magic value to indicate initialization is complete.
@@ -152,6 +138,11 @@ impl<T: SharedMemorySafe, const N: usize> IpcQueue<T, N> {
             std::ptr::addr_of_mut!((*ptr).ring.producer).write(ProducerState::default());
             std::ptr::addr_of_mut!((*ptr).ring.consumer).write(ConsumerState::default());
 
+            // Initialize all slots with their index as initial sequence number
+            for i in 0..N {
+                std::ptr::addr_of_mut!((*ptr).ring.buffer[i]).write(Slot::new(i));
+            }
+
             // Release store to signal initialization complete
             (*ptr).init.0.store(INIT_MAGIC, Ordering::Release);
         }
@@ -182,18 +173,17 @@ impl<T: SharedMemorySafe, const N: usize> IpcQueue<T, N> {
 /// Marker type to opt-out of `Sync` while remaining `Send`.
 type PhantomUnsync = PhantomData<Cell<&'static ()>>;
 
-/// Write end of the SPSC queue.
+/// Write end of the MPSC queue.
 ///
-/// Only one producer should exist per queue—multiple producers cause data races.
+/// Multiple producers can exist per queue—this is safe and expected.
+/// Each producer can push concurrently without data races.
 ///
 /// # Thread Safety
 ///
 /// `Producer` is [`Send`] but **not** [`Sync`]:
 /// - Can transfer ownership to another thread
-/// - Cannot share `&Producer` (no concurrent `push()`)
-///
-/// **Cross-process**: The type system cannot prevent multiple processes from
-/// calling `open()`. Callers must ensure exactly one producer exists.
+/// - Cannot share `&Producer` across threads
+/// - Multiple `Producer` instances for the same queue IS allowed
 pub struct Producer<T: SharedMemorySafe, const N: usize, Mode: ShmMode> {
     shm: Shm<IpcQueue<T, N>, Mode>,
     _unsync: PhantomUnsync,
@@ -202,14 +192,17 @@ pub struct Producer<T: SharedMemorySafe, const N: usize, Mode: ShmMode> {
 struct CapacityCheck<const N: usize>;
 
 impl<const N: usize> CapacityCheck<N> {
-    /// Compile-time assertion that queue capacity is non-zero.
-    const OK: () = assert!(N > 0, "Queue capacity must be greater than 0");
+    /// Compile-time assertion that queue capacity is a power of two.
+    const OK: () = assert!(
+        N > 0 && (N & (N - 1)) == 0,
+        "MPSC queue capacity must be a power of two"
+    );
 }
 
 impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Creator> {
-    /// Creates a new queue and returns the producer end.
+    /// Creates a new queue and returns a producer end.
     ///
-    /// Unlinks shared memory on drop. Fails to compile if `N == 0`.
+    /// Unlinks shared memory on drop.
     ///
     /// # Errors
     ///
@@ -228,10 +221,10 @@ impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Creator> {
 }
 
 impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Opener> {
-    /// Opens an existing queue and returns the producer end.
+    /// Opens an existing queue and returns a producer end.
     ///
     /// Does not unlink on drop. Waits up to 1s for initialization.
-    /// Fails to compile if `N == 0`.
+    /// Multiple producers can open the same queue—this is the expected use case.
     ///
     /// # Errors
     ///
@@ -259,8 +252,8 @@ impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Producer<T, N, Mode> {
     /// Returns `Err(item)` if the queue is full, allowing retry.
     #[inline]
     pub fn push(&self, item: T) -> Result<(), T> {
-        // SAFETY: Producer has exclusive access to the producer side of the ring.
-        // The IpcQueue has been initialized (checked during create/open).
+        // SAFETY: The IpcQueue has been initialized (checked during create/open).
+        // Multiple producers calling push concurrently is safe by design.
         unsafe { self.shm.ring.push(item) }
     }
 
@@ -292,10 +285,18 @@ impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Producer<T, N, Mode> {
     }
 }
 
-/// Read end of the SPSC queue.
+/// Read end of the MPSC queue.
 ///
 /// Only one consumer should exist per queue—multiple consumers cause data races.
-/// See [`Producer`] for thread safety details (same semantics apply).
+///
+/// # Thread Safety
+///
+/// `Consumer` is [`Send`] but **not** [`Sync`]:
+/// - Can transfer ownership to another thread
+/// - Cannot share `&Consumer` (no concurrent `pop()`)
+///
+/// **Cross-process**: The type system cannot prevent multiple processes from
+/// calling `open()` as consumer. Callers must ensure exactly one consumer exists.
 pub struct Consumer<T: SharedMemorySafe, const N: usize, Mode: ShmMode> {
     shm: Shm<IpcQueue<T, N>, Mode>,
     _unsync: PhantomUnsync,
@@ -304,7 +305,8 @@ pub struct Consumer<T: SharedMemorySafe, const N: usize, Mode: ShmMode> {
 impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Creator> {
     /// Creates a new queue and returns the consumer end.
     ///
-    /// Useful for daemons creating an "inbox". See [`Producer::create`] for errors.
+    /// This is the typical pattern for daemon inboxes: the daemon creates the
+    /// queue as consumer, and clients open it as producers.
     ///
     /// # Errors
     ///
@@ -381,44 +383,13 @@ impl<T: SharedMemorySafe, const N: usize, Mode: ShmMode> Consumer<T, N, Mode> {
 mod tests {
     use super::*;
     use crate::ipc::shmem::ShmPath;
-
-    const CACHE_LINE_SIZE: usize = 64;
-
-    #[test]
-    fn test_cache_line_alignment() {
-        // Verify our structs are properly aligned
-        assert_eq!(std::mem::align_of::<ProducerState>(), CACHE_LINE_SIZE);
-        assert_eq!(std::mem::align_of::<ConsumerState>(), CACHE_LINE_SIZE);
-
-        // Verify they're on separate cache lines
-        assert!(std::mem::size_of::<ProducerState>() <= CACHE_LINE_SIZE);
-        assert!(std::mem::size_of::<ConsumerState>() <= CACHE_LINE_SIZE);
-    }
-
-    #[test]
-    fn test_buffer_starts_on_separate_cache_line() {
-        use std::mem::{offset_of, size_of};
-
-        type TestQueue = IpcQueue<u64, 16>;
-
-        // Verify InitMarker takes exactly one cache line
-        assert_eq!(size_of::<InitMarker>(), CACHE_LINE_SIZE);
-
-        // Ring layout: ProducerState(64) + ConsumerState(64) + Padding(64) = 192 to buffer
-        assert_eq!(offset_of!(Ring<u64, 16>, buffer), 3 * CACHE_LINE_SIZE);
-
-        // IpcQueue layout: InitMarker(64) + Ring, so buffer is at 64 + 192 = 256
-        assert_eq!(
-            offset_of!(TestQueue, ring) + offset_of!(Ring<u64, 16>, buffer),
-            4 * CACHE_LINE_SIZE
-        );
-    }
+    use std::thread;
 
     #[test]
     fn test_basic_push_pop() {
-        let path = ShmPath::new("/test-basic-push-pop").unwrap();
-        let producer = Producer::<u64, 8, _>::create(path.clone()).unwrap();
-        let consumer = Consumer::<u64, 8, _>::open(path).unwrap();
+        let path = ShmPath::new("/test-mpsc-basic").unwrap();
+        let consumer = Consumer::<u64, 8, _>::create(path.clone()).unwrap();
+        let producer = Producer::<u64, 8, _>::open(path).unwrap();
 
         // Push a single item
         assert!(producer.push(42).is_ok());
@@ -431,30 +402,84 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_items() {
-        let path = ShmPath::new("/test-multiple-items").unwrap();
-        let producer = Producer::<u64, 16, _>::create(path.clone()).unwrap();
-        let consumer = Consumer::<u64, 16, _>::open(path).unwrap();
+    fn test_multiple_producers_same_process() {
+        let path = ShmPath::new("/test-mpsc-multi-prod").unwrap();
+        let consumer = Consumer::<u64, 16, _>::create(path.clone()).unwrap();
 
-        // Push multiple items
-        for i in 0..10 {
-            assert!(producer.push(i).is_ok());
+        // Multiple producers opening the same queue
+        let producer1 = Producer::<u64, 16, _>::open(path.clone()).unwrap();
+        let producer2 = Producer::<u64, 16, _>::open(path).unwrap();
+
+        // Both can push
+        producer1.push(1).unwrap();
+        producer2.push(2).unwrap();
+        producer1.push(3).unwrap();
+        producer2.push(4).unwrap();
+
+        // Consumer gets all items (order depends on timing, but all should arrive)
+        let mut items = vec![];
+        while let Some(item) = consumer.pop() {
+            items.push(item);
         }
 
-        // Pop them back in order (FIFO)
-        for i in 0..10 {
-            assert_eq!(consumer.pop(), Some(i));
+        items.sort();
+        assert_eq!(items, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_concurrent_producers() {
+        let path = ShmPath::new("/test-mpsc-concurrent").unwrap();
+        let consumer = Consumer::<u64, 64, _>::create(path.clone()).unwrap();
+
+        let num_producers = 4;
+        let items_per_producer = 10;
+
+        let mut handles = vec![];
+
+        for p in 0..num_producers {
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                let producer = Producer::<u64, 64, _>::open(path).unwrap();
+                for i in 0..items_per_producer {
+                    let value = (p * 100 + i) as u64;
+                    loop {
+                        if producer.push(value).is_ok() {
+                            break;
+                        }
+                        thread::yield_now();
+                    }
+                }
+            }));
         }
 
-        // Queue should now be empty
-        assert_eq!(consumer.pop(), None);
+        // Wait for all producers
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Collect all items
+        let mut items = vec![];
+        while let Some(item) = consumer.pop() {
+            items.push(item);
+        }
+
+        // Verify we got all items
+        assert_eq!(items.len(), num_producers * items_per_producer);
+
+        // Verify all expected values are present
+        for p in 0..num_producers {
+            for i in 0..items_per_producer {
+                let expected = (p * 100 + i) as u64;
+                assert!(items.contains(&expected), "Missing value {expected}");
+            }
+        }
     }
 
     #[test]
     fn test_queue_full() {
-        let path = ShmPath::new("/test-queue-full").unwrap();
-        let producer = Producer::<u64, 4, _>::create(path.clone()).unwrap();
-        let consumer = Consumer::<u64, 4, _>::open(path).unwrap();
+        let path = ShmPath::new("/test-mpsc-full").unwrap();
+        let consumer = Consumer::<u64, 4, _>::create(path.clone()).unwrap();
+        let producer = Producer::<u64, 4, _>::open(path).unwrap();
 
         // Fill the queue (capacity is 4)
         for i in 0..4 {
@@ -475,27 +500,10 @@ mod tests {
     }
 
     #[test]
-    fn test_queue_empty() {
-        let path = ShmPath::new("/test-queue-empty").unwrap();
-        let producer = Producer::<u64, 8, _>::create(path.clone()).unwrap();
-        let consumer = Consumer::<u64, 8, _>::open(path).unwrap();
-
-        // Queue starts empty
-        assert_eq!(consumer.pop(), None);
-
-        // Push and pop an item
-        producer.push(42).unwrap();
-        assert_eq!(consumer.pop(), Some(42));
-
-        // Back to empty
-        assert_eq!(consumer.pop(), None);
-    }
-
-    #[test]
-    fn test_wrapping_behavior() {
-        let path = ShmPath::new("/test-wrapping").unwrap();
-        let producer = Producer::<u64, 4, _>::create(path.clone()).unwrap();
-        let consumer = Consumer::<u64, 4, _>::open(path).unwrap();
+    fn test_wraparound() {
+        let path = ShmPath::new("/test-mpsc-wrap").unwrap();
+        let consumer = Consumer::<u64, 4, _>::create(path.clone()).unwrap();
+        let producer = Producer::<u64, 4, _>::open(path).unwrap();
 
         // Fill, drain, refill multiple times to test index wrapping
         for round in 0..5 {
@@ -514,55 +522,5 @@ mod tests {
             // Should be empty again
             assert_eq!(consumer.pop(), None);
         }
-    }
-
-    #[test]
-    fn test_interleaved_operations() {
-        let path = ShmPath::new("/test-interleaved").unwrap();
-        let producer = Producer::<u64, 8, _>::create(path.clone()).unwrap();
-        let consumer = Consumer::<u64, 8, _>::open(path).unwrap();
-
-        // Interleave push and pop operations
-        producer.push(1).unwrap();
-        producer.push(2).unwrap();
-        assert_eq!(consumer.pop(), Some(1));
-        producer.push(3).unwrap();
-        assert_eq!(consumer.pop(), Some(2));
-        assert_eq!(consumer.pop(), Some(3));
-        producer.push(4).unwrap();
-        producer.push(5).unwrap();
-        assert_eq!(consumer.pop(), Some(4));
-        assert_eq!(consumer.pop(), Some(5));
-        assert_eq!(consumer.pop(), None);
-    }
-
-    #[test]
-    fn test_consumer_creates_producer_opens() {
-        // Daemon creates an inbox to receive from clients
-        let path = ShmPath::new("/test-daemon-inbox").unwrap();
-        let consumer = Consumer::<u64, 8, _>::create(path.clone()).unwrap();
-
-        // Client opens the inbox to send to daemon
-        let producer = Producer::<u64, 8, _>::open(path).unwrap();
-
-        // Client sends messages to daemon
-        producer.push(100).unwrap();
-        producer.push(200).unwrap();
-
-        // Daemon receives messages
-        assert_eq!(consumer.pop(), Some(100));
-        assert_eq!(consumer.pop(), Some(200));
-        assert_eq!(consumer.pop(), None);
-    }
-
-    #[test]
-    fn test_producer_creates_consumer_opens() {
-        // Typical case: Producer creates, Consumer opens
-        let path = ShmPath::new("/test-client-response").unwrap();
-        let producer = Producer::<u64, 8, _>::create(path.clone()).unwrap();
-        let consumer = Consumer::<u64, 8, _>::open(path).unwrap();
-
-        producer.push(42).unwrap();
-        assert_eq!(consumer.pop(), Some(42));
     }
 }

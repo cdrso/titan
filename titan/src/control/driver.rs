@@ -7,6 +7,7 @@ use crate::control::types::{
     driver_inbox_path,
 };
 use crate::data::Frame;
+use crate::ipc::mpsc::Consumer as MpscConsumer;
 use crate::ipc::shmem::{Creator, Opener};
 use crate::ipc::spsc::{Consumer, Producer};
 use minstant::Instant;
@@ -140,7 +141,7 @@ impl Session {
 /// The driver owns an inbox queue where clients announce themselves, then
 /// opens their tx/rx channels to complete the handshake.
 pub struct Driver {
-    inbox: Consumer<ClientId, DRIVER_INBOX_CAPACITY, Creator>,
+    inbox: MpscConsumer<ClientId, DRIVER_INBOX_CAPACITY, Creator>,
     sessions: HashMap<ClientId, Session>,
 }
 
@@ -153,7 +154,7 @@ impl Driver {
     /// - [`ConnectionError::Shm`] for other shared memory errors
     pub fn new() -> Result<Self, ConnectionError> {
         let path = driver_inbox_path();
-        let inbox = Consumer::create(path)?;
+        let inbox = MpscConsumer::create(path)?;
 
         Ok(Self {
             inbox,
@@ -225,6 +226,10 @@ impl Driver {
                             {
                                 let _ = err;
                             }
+                        }
+                        ClientCommand::SubscribeRemote { .. } => {
+                            // Remote subscriptions are only supported by the runtime driver.
+                            // This legacy driver doesn't support them.
                         }
                     }
                 }
