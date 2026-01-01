@@ -7,6 +7,18 @@
 //! - Manage remote subscribers and their flow control state.
 //! - Send protocol frames (SETUP_ACK, SETUP_NAK, etc.) on behalf of control thread.
 //! - Process RX→TX events for reliability feedback.
+//!
+//! # Scheduling
+//!
+//! The TX loop uses a fair scheduling algorithm:
+//! - **Round-robin rotation**: Starting channel index rotates each tick to prevent starvation.
+//! - **Per-channel batching**: Drains up to `batch_size` messages per channel to exploit
+//!   SPSC cache locality before moving to the next channel.
+//! - **Global work budget**: Caps total messages per tick (`max_messages_per_tick`) to
+//!   bound worst-case latency.
+//!
+//! Channel ordering is stable (insertion order preserved) to ensure deterministic
+//! round-robin behavior across channel add/remove operations.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +33,12 @@ use crate::trace::{debug, info, trace, warn};
 
 use super::commands::{COMMAND_QUEUE_CAPACITY, DEFAULT_FRAME_CAP, RxToTxEvent, TxCommand};
 use super::protocol::SessionId;
+
+/// Default maximum messages to drain per channel per tick.
+const DEFAULT_BATCH_SIZE: usize = 16;
+
+/// Default maximum total messages to send per tick (bounds latency).
+const DEFAULT_MAX_MESSAGES_PER_TICK: usize = 256;
 
 /// Per-channel state maintained by the TX thread.
 struct ChannelState {
@@ -44,6 +62,26 @@ struct SubscriberState {
     receiver_window: u32,
 }
 
+/// Configuration for the TX thread.
+#[derive(Debug, Clone)]
+pub struct TxConfig {
+    /// Maximum messages to drain per channel per tick.
+    /// Exploits SPSC cache locality by batching reads from a single queue.
+    pub batch_size: usize,
+    /// Maximum total messages to send per tick across all channels.
+    /// Bounds worst-case latency by limiting work per event loop iteration.
+    pub max_messages_per_tick: usize,
+}
+
+impl Default for TxConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: DEFAULT_BATCH_SIZE,
+            max_messages_per_tick: DEFAULT_MAX_MESSAGES_PER_TICK,
+        }
+    }
+}
+
 /// TX thread state and event loop.
 pub struct TxThread {
     /// UDP socket for sending (shared with RX thread).
@@ -52,18 +90,25 @@ pub struct TxThread {
     commands: Consumer<TxCommand, COMMAND_QUEUE_CAPACITY>,
     /// Event queue from RX thread (for reliability feedback).
     rx_events: Consumer<RxToTxEvent, COMMAND_QUEUE_CAPACITY>,
-    /// Per-channel routing state.
+    /// Per-channel routing state (keyed for O(1) lookup).
     channels: HashMap<ChannelId, ChannelState>,
+    /// Stable-order list of channel IDs for fair round-robin scheduling.
+    /// Maintained separately from HashMap to ensure deterministic iteration order.
+    channel_order: Vec<ChannelId>,
     /// Reusable buffer for encoding messages.
     encode_buf: Vec<u8>,
+    /// Reusable buffer for collecting endpoints (avoids per-message allocation).
+    endpoint_buf: Vec<Endpoint>,
     /// Maximum messages to drain per channel per tick.
     batch_size: usize,
+    /// Maximum total messages to send per tick.
+    max_messages_per_tick: usize,
     /// Index to rotate starting channel for fairness.
     round_robin_offset: usize,
 }
 
 impl TxThread {
-    /// Creates a new TX thread state.
+    /// Creates a new TX thread state with default configuration.
     ///
     /// # Arguments
     ///
@@ -75,13 +120,26 @@ impl TxThread {
         commands: Consumer<TxCommand, COMMAND_QUEUE_CAPACITY>,
         rx_events: Consumer<RxToTxEvent, COMMAND_QUEUE_CAPACITY>,
     ) -> Self {
+        Self::with_config(socket, commands, rx_events, TxConfig::default())
+    }
+
+    /// Creates a new TX thread state with custom configuration.
+    pub fn with_config(
+        socket: Arc<UdpSocket>,
+        commands: Consumer<TxCommand, COMMAND_QUEUE_CAPACITY>,
+        rx_events: Consumer<RxToTxEvent, COMMAND_QUEUE_CAPACITY>,
+        config: TxConfig,
+    ) -> Self {
         Self {
             socket,
             commands,
             rx_events,
             channels: HashMap::new(),
+            channel_order: Vec::new(),
             encode_buf: Vec::with_capacity(2048),
-            batch_size: 16,
+            endpoint_buf: Vec::with_capacity(16),
+            batch_size: config.batch_size,
+            max_messages_per_tick: config.max_messages_per_tick,
             round_robin_offset: 0,
         }
     }
@@ -125,6 +183,10 @@ impl TxThread {
                         endpoints = ?endpoints,
                         "TX: adding channel"
                     );
+                    // Only add to order list if not already present (idempotent)
+                    if !self.channels.contains_key(&channel) {
+                        self.channel_order.push(channel);
+                    }
                     self.channels.insert(
                         channel,
                         ChannelState {
@@ -138,6 +200,14 @@ impl TxThread {
                 TxCommand::RemoveChannel { channel } => {
                     info!(channel = %channel, "TX: removing channel");
                     self.channels.remove(&channel);
+                    // Remove from order list (maintains relative order of remaining channels)
+                    self.channel_order.retain(|&id| id != channel);
+                    // Adjust round_robin_offset if it now points past the end
+                    if !self.channel_order.is_empty() {
+                        self.round_robin_offset %= self.channel_order.len();
+                    } else {
+                        self.round_robin_offset = 0;
+                    }
                 }
                 TxCommand::UpdateEndpoints { channel, endpoints } => {
                     debug!(channel = %channel, endpoints = ?endpoints, "TX: updating endpoints");
@@ -235,41 +305,54 @@ impl TxThread {
     }
 
     /// Drains client queues and sends to network endpoints.
+    ///
+    /// Uses round-robin scheduling with per-channel batching:
+    /// - Rotates starting channel each tick for fairness
+    /// - Drains up to `batch_size` messages per channel
+    /// - Stops after `max_messages_per_tick` total messages
     fn drain_and_send(&mut self) {
-        if self.channels.is_empty() {
+        let num_channels = self.channel_order.len();
+        if num_channels == 0 {
             return;
         }
 
-        // Get channel IDs for iteration (avoid borrow issues)
-        let channel_ids: Vec<_> = self.channels.keys().copied().collect();
-        let num_channels = channel_ids.len();
+        let mut budget = self.max_messages_per_tick;
 
-        // Rotate starting point for fairness
+        // Rotate through channels starting from round_robin_offset
         for i in 0..num_channels {
-            let idx = (self.round_robin_offset + i) % num_channels;
-            let channel_id = channel_ids[idx];
+            if budget == 0 {
+                break;
+            }
 
-            self.drain_channel(channel_id);
+            let idx = (self.round_robin_offset + i) % num_channels;
+            let channel_id = self.channel_order[idx];
+
+            let sent = self.drain_channel(channel_id, budget);
+            budget = budget.saturating_sub(sent);
         }
 
-        self.round_robin_offset = (self.round_robin_offset + 1) % num_channels.max(1);
+        // Advance round-robin offset for next tick
+        self.round_robin_offset = (self.round_robin_offset + 1) % num_channels;
     }
 
-    /// Drains a single channel up to batch_size messages.
-    fn drain_channel(&mut self, channel_id: ChannelId) {
-        let batch_size = self.batch_size;
+    /// Drains a single channel up to `limit` messages (capped by batch_size).
+    ///
+    /// Returns the number of messages actually sent.
+    fn drain_channel(&mut self, channel_id: ChannelId, limit: usize) -> usize {
+        let max_to_send = self.batch_size.min(limit);
+        let mut sent = 0;
 
-        for _ in 0..batch_size {
+        for _ in 0..max_to_send {
             // Get mutable reference to channel state
             let state = match self.channels.get_mut(&channel_id) {
                 Some(s) => s,
-                None => return,
+                None => return sent,
             };
 
             // Pop frame from client queue
             let frame = match state.queue.pop() {
                 Some(f) => f,
-                None => return,
+                None => return sent,
             };
 
             // Assign sequence number and timestamp
@@ -277,16 +360,17 @@ impl TxThread {
             state.next_seq = seq.next();
             let timestamp = Micros::now();
 
-            // Collect all endpoints: static endpoints + dynamic subscribers
-            let mut all_endpoints: Vec<_> = state.endpoints.iter().copied().collect();
+            // Collect all endpoints into reusable buffer
+            self.endpoint_buf.clear();
+            self.endpoint_buf.extend(state.endpoints.iter().copied());
             for sub in state.subscribers.values() {
-                all_endpoints.push(sub.endpoint);
+                self.endpoint_buf.push(sub.endpoint);
             }
 
             trace!(
                 channel = %channel_id,
                 seq = %seq,
-                endpoints_count = all_endpoints.len(),
+                endpoints_count = self.endpoint_buf.len(),
                 frame_len = frame.len(),
                 "TX: sending DATA"
             );
@@ -306,10 +390,14 @@ impl TxThread {
             }
 
             // Fan-out to all endpoints (static + dynamic subscribers)
-            for endpoint in &all_endpoints {
+            for endpoint in &self.endpoint_buf {
                 // Best-effort send - ignore errors
                 let _ = self.socket.try_send_to(&self.encode_buf, *endpoint);
             }
+
+            sent += 1;
         }
+
+        sent
     }
 }
