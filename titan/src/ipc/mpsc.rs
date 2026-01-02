@@ -205,7 +205,7 @@ struct CapacityCheck<const N: usize>;
 impl<const N: usize> CapacityCheck<N> {
     /// Compile-time assertion that queue capacity is a power of two.
     const OK: () = assert!(
-        N > 0 && (N & (N - 1)) == 0,
+        N.is_power_of_two(),
         "MPSC queue capacity must be a power of two"
     );
 }
@@ -245,9 +245,8 @@ impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Opener> {
 
         let shm = Shm::<IpcQueue<T, N>, Opener>::open(path.clone())?;
         // SAFETY: Shm::open guarantees the pointer is valid and mapped.
-        let _proof = match unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) } {
-            Some(proof) => proof,
-            None => return Err(ShmError::InitTimeout { path: path.into() }),
+        let Some(_proof) = (unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) }) else {
+            return Err(ShmError::InitTimeout { path: path.into() });
         };
         Ok(Self {
             shm,
@@ -345,9 +344,8 @@ impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Opener> {
         let () = CapacityCheck::<N>::OK;
         let shm = Shm::<IpcQueue<T, N>, Opener>::open(path.clone())?;
         // SAFETY: Shm::open guarantees the pointer is valid and mapped.
-        let _proof = match unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) } {
-            Some(proof) => proof,
-            None => return Err(ShmError::InitTimeout { path: path.into() }),
+        let Some(_proof) = (unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) }) else {
+            return Err(ShmError::InitTimeout { path: path.into() });
         };
         Ok(Self {
             shm,

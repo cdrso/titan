@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// A slot in the MPSC ring buffer with sequence number for synchronization.
 #[repr(C)]
 #[repr(align(64))] // Each slot on its own cache line to avoid false sharing between producers
-pub(crate) struct Slot<T> {
+pub struct Slot<T> {
     /// Sequence number for synchronization.
     /// - Initial: slot index (0, 1, 2, ..., N-1)
     /// - After producer write: position + 1 (signals "data ready")
@@ -56,9 +56,9 @@ unsafe impl<T: Send> Send for Slot<T> {}
 /// Producer-side state: head index for slot reservation.
 #[repr(C)]
 #[repr(align(64))]
-pub(crate) struct ProducerState {
+pub struct ProducerState {
     /// Next position to reserve for writing.
-    /// Multiple producers atomically increment this via fetch_add.
+    /// Multiple producers atomically increment this via `fetch_add`.
     pub(crate) head: AtomicUsize,
 }
 
@@ -79,7 +79,7 @@ impl Default for ProducerState {
 /// Consumer-side state: tail index and cached values.
 #[repr(C)]
 #[repr(align(64))]
-pub(crate) struct ConsumerState {
+pub struct ConsumerState {
     /// Next position to read from.
     /// Only the consumer modifies this.
     pub(crate) tail: AtomicUsize,
@@ -103,7 +103,7 @@ impl Default for ConsumerState {
 ///
 /// This is the shared implementation used by IPC-backed queues.
 #[repr(C)]
-pub(crate) struct Ring<T, const N: usize> {
+pub struct Ring<T, const N: usize> {
     /// Producer state (head index for reservation).
     pub(crate) producer: ProducerState,
 
@@ -121,7 +121,7 @@ impl<T, const N: usize> Ring<T, N> {
 
     /// Compile-time check that N is a power of two.
     const _POWER_OF_TWO: () = assert!(
-        N > 0 && (N & (N - 1)) == 0,
+        N.is_power_of_two(),
         "MPSC ring capacity must be a power of two"
     );
 
@@ -157,29 +157,29 @@ impl<T, const N: usize> Ring<T, N> {
             if diff == 0 {
                 // Slot is available for writing at this position.
                 // Try to reserve it atomically.
-                match self.producer.head.compare_exchange_weak(
-                    pos,
-                    pos.wrapping_add(1),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        // Successfully reserved this slot.
-                        // SAFETY: We have exclusive write access because:
-                        // - CAS succeeded, so no other producer can claim this slot
-                        // - seq == pos means consumer has released it
-                        unsafe {
-                            (*slot.value.get()).write(item);
-                        }
-                        // Publish the write by setting seq = pos + 1
-                        slot.seq.store(pos.wrapping_add(1), Ordering::Release);
-                        return Ok(());
+                if self
+                    .producer
+                    .head
+                    .compare_exchange_weak(
+                        pos,
+                        pos.wrapping_add(1),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    // Successfully reserved this slot.
+                    // SAFETY: We have exclusive write access because:
+                    // - CAS succeeded, so no other producer can claim this slot
+                    // - seq == pos means consumer has released it
+                    unsafe {
+                        (*slot.value.get()).write(item);
                     }
-                    Err(_) => {
-                        // Another producer beat us, retry with new head
-                        continue;
-                    }
+                    // Publish the write by setting seq = pos + 1
+                    slot.seq.store(pos.wrapping_add(1), Ordering::Release);
+                    return Ok(());
                 }
+                // CAS failed: another producer beat us, retry with new head
             } else if diff < 0 {
                 // seq < pos: Slot is not yet released by consumer.
                 // Queue is full.

@@ -201,7 +201,8 @@ impl Driver {
                             disconnected.push(session.conn.id);
                             break;
                         }
-                        ClientCommand::Heartbeat => {}
+                        // Heartbeat: valid but no-op; SubscribeRemote: unsupported in legacy driver
+                        ClientCommand::Heartbeat | ClientCommand::SubscribeRemote { .. } => {}
                         ClientCommand::OpenTx { channel, .. } => {
                             if let Err(err) =
                                 session.data_channels.handle_open_tx(&session.conn, channel)
@@ -226,10 +227,6 @@ impl Driver {
                             {
                                 let _ = err;
                             }
-                        }
-                        ClientCommand::SubscribeRemote { .. } => {
-                            // Remote subscriptions are only supported by the runtime driver.
-                            // This legacy driver doesn't support them.
                         }
                     }
                 }

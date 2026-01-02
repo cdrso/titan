@@ -252,9 +252,8 @@ impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Opener> {
 
         let shm = Shm::<IpcQueue<T, N>, Opener>::open(path.clone())?;
         // SAFETY: Shm::open guarantees the pointer is valid and mapped.
-        let _proof = match unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) } {
-            Some(proof) => proof,
-            None => return Err(ShmError::InitTimeout { path: path.into() }),
+        let Some(_proof) = (unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) }) else {
+            return Err(ShmError::InitTimeout { path: path.into() });
         };
         Ok(Self {
             shm,
@@ -343,9 +342,8 @@ impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Opener> {
         let () = CapacityCheck::<N>::OK;
         let shm = Shm::<IpcQueue<T, N>, Opener>::open(path.clone())?;
         // SAFETY: Shm::open guarantees the pointer is valid and mapped.
-        let _proof = match unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) } {
-            Some(proof) => proof,
-            None => return Err(ShmError::InitTimeout { path: path.into() }),
+        let Some(_proof) = (unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) }) else {
+            return Err(ShmError::InitTimeout { path: path.into() });
         };
         Ok(Self {
             shm,

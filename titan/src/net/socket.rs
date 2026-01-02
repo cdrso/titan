@@ -72,6 +72,9 @@ impl UdpSocket {
     /// Attempts to send, returning `Ok(None)` instead of `WouldBlock`.
     ///
     /// Useful in polling loops where `WouldBlock` is expected.
+    ///
+    /// # Errors
+    /// Returns I/O errors other than `WouldBlock`.
     pub fn try_send_to(&self, buf: &[u8], dest: Endpoint) -> io::Result<Option<usize>> {
         match self.send_to(buf, dest) {
             Ok(n) => Ok(Some(n)),
@@ -83,6 +86,9 @@ impl UdpSocket {
     /// Attempts to receive, returning `Ok(None)` instead of `WouldBlock`.
     ///
     /// Useful in polling loops where `WouldBlock` is expected.
+    ///
+    /// # Errors
+    /// Returns I/O errors other than `WouldBlock`.
     pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(usize, Endpoint)>> {
         match self.recv_from(buf) {
             Ok((n, ep)) => Ok(Some((n, ep))),

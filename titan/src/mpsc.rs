@@ -6,4 +6,4 @@
 //! Used by:
 //! - [`crate::ipc::mpsc`] - Cross-process queues over shared memory
 
-pub(crate) mod ring;
+pub mod ring;

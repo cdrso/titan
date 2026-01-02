@@ -15,13 +15,13 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Role marker: Fields with this role are owned exclusively by the producer.
-pub(crate) struct ProducerRole;
+pub struct ProducerRole;
 
 /// Role marker: Fields with this role are owned exclusively by the consumer.
-pub(crate) struct ConsumerRole;
+pub struct ConsumerRole;
 
 /// Role marker: Buffer slots whose ownership transfers via the SPSC protocol.
-pub(crate) struct SlotRole;
+pub struct SlotRole;
 
 /// Interior-mutable cell with a role marker for nominal type safety.
 ///
@@ -29,14 +29,14 @@ pub(crate) struct SlotRole;
 /// The `Role` doesn't affect runtime behavior—it exists purely to make different
 /// logical "kinds" of cells into distinct types at compile time.
 #[repr(transparent)]
-pub(crate) struct SpscCell<T, Role>(UnsafeCell<T>, PhantomData<Role>);
+pub struct SpscCell<T, Role>(UnsafeCell<T>, PhantomData<Role>);
 
 impl<T, Role> SpscCell<T, Role> {
-    pub(crate) const fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         Self(UnsafeCell::new(value), PhantomData)
     }
 
-    pub(crate) const fn get(&self) -> &UnsafeCell<T> {
+    pub const fn get(&self) -> &UnsafeCell<T> {
         &self.0
     }
 }
@@ -49,31 +49,31 @@ unsafe impl<T: Send, Role> Sync for SpscCell<T, Role> {}
 unsafe impl<T: Send, Role> Send for SpscCell<T, Role> {}
 
 /// Cache cell owned exclusively by the producer.
-pub(crate) type ProducerCache<T> = SpscCell<T, ProducerRole>;
+pub type ProducerCache<T> = SpscCell<T, ProducerRole>;
 
 /// Cache cell owned exclusively by the consumer.
-pub(crate) type ConsumerCache<T> = SpscCell<T, ConsumerRole>;
+pub type ConsumerCache<T> = SpscCell<T, ConsumerRole>;
 
 /// Buffer slot cell with ownership governed by the SPSC protocol.
-pub(crate) type SlotCell<T> = SpscCell<T, SlotRole>;
+pub type SlotCell<T> = SpscCell<T, SlotRole>;
 
 /// Producer-side state: head index and cached tail.
 #[repr(C)]
 #[repr(align(64))]
-pub(crate) struct ProducerState {
+pub struct ProducerState {
     /// Write index (next slot to write to).
     /// Owned by producer, read by consumer.
-    pub(crate) head: AtomicUsize,
+    pub head: AtomicUsize,
 
     /// Producer-local cursor tracking `head % N`.
-    pub(crate) cursor: ProducerCache<usize>,
+    pub cursor: ProducerCache<usize>,
 
     /// Cached copy of tail index.
-    pub(crate) cached_tail: ProducerCache<usize>,
+    pub cached_tail: ProducerCache<usize>,
 }
 
 impl ProducerState {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             head: AtomicUsize::new(0),
             cursor: ProducerCache::new(0),
@@ -91,20 +91,20 @@ impl Default for ProducerState {
 /// Consumer-side state: tail index and cached head.
 #[repr(C)]
 #[repr(align(64))]
-pub(crate) struct ConsumerState {
+pub struct ConsumerState {
     /// Read index (next slot to read from).
     /// Owned by consumer, read by producer.
-    pub(crate) tail: AtomicUsize,
+    pub tail: AtomicUsize,
 
     /// Consumer-local cursor tracking `tail % N`.
-    pub(crate) cursor: ConsumerCache<usize>,
+    pub cursor: ConsumerCache<usize>,
 
     /// Cached copy of head index.
-    pub(crate) cached_head: ConsumerCache<usize>,
+    pub cached_head: ConsumerCache<usize>,
 }
 
 impl ConsumerState {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             tail: AtomicUsize::new(0),
             cursor: ConsumerCache::new(0),
@@ -121,8 +121,8 @@ impl Default for ConsumerState {
 
 /// A single slot in the ring buffer.
 #[repr(C)]
-pub(crate) struct Slot<T> {
-    pub(crate) value: SlotCell<MaybeUninit<T>>,
+pub struct Slot<T> {
+    pub value: SlotCell<MaybeUninit<T>>,
 }
 
 /// Core ring buffer structure without IPC-specific fields.
@@ -130,18 +130,18 @@ pub(crate) struct Slot<T> {
 /// This is the shared implementation used by both IPC and heap-backed queues.
 /// It contains only the essential SPSC algorithm state.
 #[repr(C)]
-pub(crate) struct Ring<T, const N: usize> {
+pub struct Ring<T, const N: usize> {
     /// Producer state (head index + cached tail).
-    pub(crate) producer: ProducerState,
+    pub producer: ProducerState,
 
     /// Consumer state (tail index + cached head).
-    pub(crate) consumer: ConsumerState,
+    pub consumer: ConsumerState,
 
     /// Prevent false sharing between consumer state and buffer.
-    pub(crate) _padding: [u8; 64],
+    pub _padding: [u8; 64],
 
     /// Ring buffer slots.
-    pub(crate) buffer: [Slot<T>; N],
+    pub buffer: [Slot<T>; N],
 }
 
 impl<T, const N: usize> Ring<T, N> {
@@ -150,7 +150,7 @@ impl<T, const N: usize> Ring<T, N> {
     /// This is equivalent to `(cursor + 1) % N` but avoids the division instruction,
     /// using a comparison and conditional move instead.
     #[inline]
-    pub(crate) const fn bump_cursor(cursor: usize) -> usize {
+    pub const fn bump_cursor(cursor: usize) -> usize {
         let next = cursor + 1;
         if next == N { 0 } else { next }
     }
@@ -163,7 +163,7 @@ impl<T, const N: usize> Ring<T, N> {
     /// - Only one thread/process calls this method (single producer)
     /// - The ring has been properly initialized
     #[inline]
-    pub(crate) unsafe fn push(&self, item: T) -> Result<(), T> {
+    pub unsafe fn push(&self, item: T) -> Result<(), T> {
         // Load current head (producer-local, relaxed is fine)
         let head = self.producer.head.load(Ordering::Relaxed);
 
@@ -223,7 +223,7 @@ impl<T, const N: usize> Ring<T, N> {
     /// - Only one thread/process calls this method (single consumer)
     /// - The ring has been properly initialized
     #[inline]
-    pub(crate) unsafe fn pop(&self) -> Option<T> {
+    pub unsafe fn pop(&self) -> Option<T> {
         // Load current tail (consumer-local, relaxed is fine)
         let tail = self.consumer.tail.load(Ordering::Relaxed);
 

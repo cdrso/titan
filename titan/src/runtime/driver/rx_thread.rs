@@ -47,7 +47,7 @@ pub struct RxThread {
     /// Per-channel demux state (for local channels).
     channels: HashMap<ChannelId, ChannelState>,
     /// Remote stream to local channel mappings.
-    /// Maps (remote_endpoint, remote_channel) → local_channel.
+    /// Maps (`remote_endpoint`, `remote_channel`) → `local_channel`.
     remote_mappings: HashMap<RemoteStreamKey, ChannelId>,
     /// Reusable buffer for receiving datagrams.
     recv_buf: Vec<u8>,
@@ -106,9 +106,9 @@ impl RxThread {
                 RxCommand::AddChannel {
                     channel,
                     queue,
-                    client,
+                    client: _client,
                 } => {
-                    info!(channel = %channel, client = %client, "RX: adding channel");
+                    info!(channel = %channel, client = %_client, "RX: adding channel");
                     self.channels.insert(
                         channel,
                         ChannelState {
@@ -153,31 +153,27 @@ impl RxThread {
     /// Receives packets from the socket and demuxes to client queues.
     fn receive_and_demux(&mut self) {
         // Try to receive a packet (non-blocking)
-        let (len, from) = match self.socket.try_recv_from(&mut self.recv_buf) {
-            Ok(Some((len, from))) => (len, from),
-            Ok(None) => return, // No data available
-            Err(_) => return,   // I/O error, skip
+        let Ok(Some((len, from))) = self.socket.try_recv_from(&mut self.recv_buf) else {
+            return; // No data or I/O error
         };
 
         if len == 0 {
             return;
         }
 
-        let from_endpoint = Endpoint::from(from);
-
         // Classify frame type from first byte - produces typed evidence
         match frame_type::classify(self.recv_buf[0]) {
-            FrameKind::Protocol(_) => self.handle_protocol_frame(len, from_endpoint),
-            FrameKind::Data(_) => self.handle_data_frame(len, from_endpoint),
+            FrameKind::Protocol(_) => self.handle_protocol_frame(len, from),
+            FrameKind::Data(_) => self.handle_data_frame(len, from),
         }
     }
 
     /// Handles an incoming protocol frame.
-    fn handle_protocol_frame(&mut self, len: usize, from: Endpoint) {
+    fn handle_protocol_frame(&self, len: usize, from: Endpoint) {
         let frame = match decode_frame(&self.recv_buf[..len]) {
             Ok(f) => f,
-            Err(e) => {
-                warn!(from = %from, error = ?e, "RX: malformed protocol frame");
+            Err(_e) => {
+                warn!(from = %from, error = ?_e, "RX: malformed protocol frame");
                 return;
             }
         };
@@ -274,19 +270,19 @@ impl RxThread {
             Err(_) => return, // Malformed packet, skip
         };
 
-        self.handle_message(msg, from);
+        self.handle_message(&msg, from);
     }
 
     /// Handles a decoded data plane message.
-    fn handle_message(&mut self, msg: DataPlaneMessage<DEFAULT_FRAME_CAP>, from: Endpoint) {
-        match msg {
+    fn handle_message(&mut self, msg: &DataPlaneMessage<DEFAULT_FRAME_CAP>, from: Endpoint) {
+        match *msg {
             DataPlaneMessage::Data {
                 channel,
                 seq,
                 frame,
                 ..
             } => {
-                self.handle_data(channel, seq, frame, from);
+                self.handle_data(channel, seq, &frame, from);
             }
             DataPlaneMessage::Ack { channel, seq, .. } => {
                 // Forward to TX thread
@@ -327,7 +323,7 @@ impl RxThread {
         &mut self,
         channel: ChannelId,
         seq: crate::data::types::SeqNum,
-        frame: Frame<DEFAULT_FRAME_CAP>,
+        frame: &Frame<DEFAULT_FRAME_CAP>,
         from: Endpoint,
     ) {
         // First try direct local channel lookup
@@ -348,12 +344,9 @@ impl RxThread {
             }
         };
 
-        let state = match self.channels.get_mut(&local_channel) {
-            Some(s) => s,
-            None => {
-                warn!(local_channel = %local_channel, "RX: local channel not found, dropping");
-                return;
-            }
+        let Some(state) = self.channels.get_mut(&local_channel) else {
+            warn!(local_channel = %local_channel, "RX: local channel not found, dropping");
+            return;
         };
 
         trace!(
@@ -374,7 +367,7 @@ impl RxThread {
 
         // Push frame to client's RX queue
         // Best-effort: drop if queue is full
-        if state.queue.push(frame).is_err() {
+        if state.queue.push(*frame).is_err() {
             warn!(local_channel = %local_channel, seq = %seq, "RX: client queue full, dropping frame");
         }
     }

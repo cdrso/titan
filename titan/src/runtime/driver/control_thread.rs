@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use minstant::Instant;
 
-use crate::trace::{debug, info, trace, warn};
+use crate::trace::{debug, info, warn};
 
 use crate::control::handshake::driver_accept;
 use crate::control::types::{
@@ -77,7 +77,7 @@ struct Publication {
     client: ClientId,
 }
 
-/// State for a pending outgoing subscription (waiting for SETUP_ACK/NAK).
+/// State for a pending outgoing subscription (waiting for `SETUP_ACK`/`NAK`).
 struct PendingSubscription {
     /// Local channel ID for this subscription.
     local_channel: ChannelId,
@@ -92,12 +92,11 @@ struct PendingSubscription {
 /// State for an active remote subscription (receiving data from remote publisher).
 struct RemoteSubscription {
     /// Local channel ID for routing to client.
-    local_channel: ChannelId,
+    _local_channel: ChannelId,
     /// Remote publisher's session ID (for Status Messages).
-    #[allow(dead_code)]
-    publisher_session: SessionId,
+    _publisher_session: SessionId,
     /// Client that owns this subscription.
-    client: ClientId,
+    _client: ClientId,
 }
 
 /// Control thread state and event loop.
@@ -112,13 +111,13 @@ pub struct ControlThread {
     rx_commands: Producer<RxCommand, COMMAND_QUEUE_CAPACITY>,
     /// Event queue from RX thread (protocol frames).
     rx_events: Consumer<RxToControlEvent, COMMAND_QUEUE_CAPACITY>,
-    /// Published channels (ChannelId → Publication).
+    /// Published channels (`ChannelId` → `Publication`).
     /// These are channels where local clients send data that we publish to remote subscribers.
     publications: HashMap<ChannelId, Publication>,
-    /// Pending outgoing subscriptions (SessionId → PendingSubscription).
+    /// Pending outgoing subscriptions (`SessionId` → `PendingSubscription`).
     /// Keyed by our session ID from the SETUP we sent.
     pending_subscriptions: HashMap<SessionId, PendingSubscription>,
-    /// Active remote subscriptions (keyed by (remote_endpoint, remote_channel)).
+    /// Active remote subscriptions (keyed by (`remote_endpoint`, `remote_channel`)).
     /// Used to route incoming DATA frames to the correct local client.
     remote_subscriptions: HashMap<(Endpoint, ChannelId), RemoteSubscription>,
     /// Network endpoints for channel fan-out.
@@ -263,13 +262,10 @@ impl ControlThread {
         );
 
         // Check if we have a publication for this channel
-        let publication = match self.publications.get(&channel) {
-            Some(pub_) => pub_,
-            None => {
-                warn!(channel = %channel, from = %from, "SETUP rejected: channel not found");
-                self.send_setup_nak(from, session, NakReason::ChannelNotFound);
-                return;
-            }
+        let Some(publication) = self.publications.get(&channel) else {
+            warn!(channel = %channel, from = %from, "SETUP rejected: channel not found");
+            self.send_setup_nak(from, session, NakReason::ChannelNotFound);
+            return;
         };
 
         // Validate type hash
@@ -316,7 +312,7 @@ impl ControlThread {
         self.send_setup_ack(from, session, publisher_session, negotiated_mtu);
     }
 
-    /// Sends a SETUP_ACK frame to a subscriber.
+    /// Sends a `SETUP_ACK` frame to a subscriber.
     fn send_setup_ack(
         &mut self,
         to: Endpoint,
@@ -341,7 +337,7 @@ impl ControlThread {
         }
     }
 
-    /// Sends a SETUP_NAK frame to a subscriber.
+    /// Sends a `SETUP_NAK` frame to a subscriber.
     fn send_setup_nak(&mut self, to: Endpoint, session: SessionId, reason: NakReason) {
         let frame = ProtocolFrame::SetupNak(SetupNakFrame { session, reason });
 
@@ -357,9 +353,9 @@ impl ControlThread {
     }
 
     /// Handles a TEARDOWN from a remote peer.
-    fn handle_teardown(&mut self, session: SessionId) {
+    fn handle_teardown(&self, session: SessionId) {
         // Find and remove the subscriber from all channels
-        for (channel, _) in self.publications.iter() {
+        for channel in self.publications.keys() {
             let cmd = TxCommand::RemoveSubscriber {
                 channel: *channel,
                 session,
@@ -370,7 +366,7 @@ impl ControlThread {
         }
     }
 
-    /// Handles SETUP_ACK from a remote publisher (subscription accepted).
+    /// Handles `SETUP_ACK` from a remote publisher (subscription accepted).
     fn handle_setup_ack(
         &mut self,
         from: Endpoint,
@@ -385,12 +381,9 @@ impl ControlThread {
         );
 
         // Find the pending subscription by our session ID
-        let pending = match self.pending_subscriptions.remove(&session) {
-            Some(p) => p,
-            None => {
-                warn!(session = %session, "SETUP_ACK for unknown session, ignoring");
-                return;
-            }
+        let Some(pending) = self.pending_subscriptions.remove(&session) else {
+            warn!(session = %session, "SETUP_ACK for unknown session, ignoring");
+            return;
         };
 
         // Verify the ACK came from the expected endpoint
@@ -417,9 +410,9 @@ impl ControlThread {
         self.remote_subscriptions.insert(
             key,
             RemoteSubscription {
-                local_channel: pending.local_channel,
-                publisher_session,
-                client: pending.client,
+                _local_channel: pending.local_channel,
+                _publisher_session: publisher_session,
+                _client: pending.client,
             },
         );
 
@@ -440,29 +433,25 @@ impl ControlThread {
         }
 
         // Notify the client that subscription is ready
-        if let Some(session) = self.sessions.get(&pending.client) {
-            if session
+        if let Some(session) = self.sessions.get(&pending.client)
+            && session
                 .conn
                 .tx
                 .push(DriverMessage::SubscriptionReady(pending.local_channel))
                 .is_err()
-            {
-                warn!(client = %pending.client, channel = %pending.local_channel, "client queue full, dropping SubscriptionReady");
-            }
+        {
+            warn!(client = %pending.client, channel = %pending.local_channel, "client queue full, dropping SubscriptionReady");
         }
     }
 
-    /// Handles SETUP_NAK from a remote publisher (subscription rejected).
+    /// Handles `SETUP_NAK` from a remote publisher (subscription rejected).
     fn handle_setup_nak(&mut self, session: SessionId, reason: NakReason) {
         warn!(session = %session, reason = ?reason, "received SETUP_NAK");
 
         // Find the pending subscription by our session ID
-        let pending = match self.pending_subscriptions.remove(&session) {
-            Some(p) => p,
-            None => {
-                warn!(session = %session, "SETUP_NAK for unknown session, ignoring");
-                return;
-            }
+        let Some(pending) = self.pending_subscriptions.remove(&session) else {
+            warn!(session = %session, "SETUP_NAK for unknown session, ignoring");
+            return;
         };
 
         warn!(
@@ -482,8 +471,8 @@ impl ControlThread {
         };
 
         // Notify the client that subscription failed
-        if let Some(session) = self.sessions.get(&pending.client) {
-            if session
+        if let Some(session) = self.sessions.get(&pending.client)
+            && session
                 .conn
                 .tx
                 .push(DriverMessage::SubscriptionFailed {
@@ -491,9 +480,8 @@ impl ControlThread {
                     reason: failure,
                 })
                 .is_err()
-            {
-                warn!(client = %pending.client, channel = %pending.local_channel, "client queue full, dropping SubscriptionFailed");
-            }
+        {
+            warn!(client = %pending.client, channel = %pending.local_channel, "client queue full, dropping SubscriptionFailed");
         }
     }
 
@@ -553,7 +541,7 @@ impl ControlThread {
     }
 
     /// Performs graceful shutdown: notifies clients and TX/RX threads.
-    fn do_shutdown(&mut self) {
+    fn do_shutdown(&self) {
         // Notify all clients
         for session in self.sessions.values() {
             if session.conn.tx.push(DriverMessage::Shutdown).is_err() {
@@ -579,8 +567,8 @@ impl ControlThread {
                     info!(client_id = %client_id, "client session established");
                     self.sessions.insert(conn.id, Session::new(conn));
                 }
-                Err(e) => {
-                    warn!(client_id = %client_id, error = ?e, "failed to accept client");
+                Err(_e) => {
+                    warn!(client_id = %client_id, error = ?_e, "failed to accept client");
                 }
             }
         }
@@ -687,7 +675,7 @@ impl ControlThread {
         disconnected
     }
 
-    /// Handles OpenTx command: client wants to send data to driver.
+    /// Handles `OpenTx` command: client wants to send data to driver.
     ///
     /// Returns the publication info to register if successful.
     fn handle_open_tx(
@@ -715,8 +703,8 @@ impl ControlThread {
         let path = data_tx_path(&session.conn.id, channel);
         let queue: ClientTxQueue = match IpcConsumer::open(path) {
             Ok(q) => q,
-            Err(e) => {
-                warn!(client = %session.conn.id, channel = %channel, error = ?e, "OpenTx failed: cannot open queue");
+            Err(_e) => {
+                warn!(client = %session.conn.id, channel = %channel, error = ?_e, "OpenTx failed: cannot open queue");
                 if session.conn.tx.push(DriverMessage::ChannelError(channel)).is_err() {
                     warn!(client = %session.conn.id, channel = %channel, "client queue full, dropping ChannelError");
                 }
@@ -762,7 +750,7 @@ impl ControlThread {
         ))
     }
 
-    /// Handles OpenRx command: client wants to receive data from driver.
+    /// Handles `OpenRx` command: client wants to receive data from driver.
     fn handle_open_rx(
         session: &mut Session,
         channel: ChannelId,
@@ -781,8 +769,8 @@ impl ControlThread {
         let path = data_rx_path(&session.conn.id, channel);
         let queue: ClientRxQueue = match IpcProducer::open(path) {
             Ok(q) => q,
-            Err(e) => {
-                warn!(client = %session.conn.id, channel = %channel, error = ?e, "OpenRx failed: cannot open queue");
+            Err(_e) => {
+                warn!(client = %session.conn.id, channel = %channel, error = ?_e, "OpenRx failed: cannot open queue");
                 if session.conn.tx.push(DriverMessage::ChannelError(channel)).is_err() {
                     warn!(client = %session.conn.id, channel = %channel, "client queue full, dropping ChannelError");
                 }
@@ -812,7 +800,7 @@ impl ControlThread {
         info!(client = %session.conn.id, channel = %channel, "RX channel opened");
     }
 
-    /// Handles CloseChannel command.
+    /// Handles `CloseChannel` command.
     fn handle_close_channel(
         session: &mut Session,
         channel: ChannelId,

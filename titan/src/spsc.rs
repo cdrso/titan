@@ -4,4 +4,4 @@
 //! - [`crate::ipc::spsc`] - Cross-process queues over shared memory
 //! - [`crate::sync::spsc`] - In-process queues over heap memory
 
-pub(crate) mod ring;
+pub mod ring;

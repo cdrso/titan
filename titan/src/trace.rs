@@ -29,7 +29,7 @@ pub fn init_tracing() {
 }
 
 #[cfg(not(feature = "tracing"))]
-pub fn init_tracing() {}
+pub const fn init_tracing() {}
 
 // When tracing is enabled, re-export macros from the tracing crate.
 #[cfg(feature = "tracing")]

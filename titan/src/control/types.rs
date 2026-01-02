@@ -184,7 +184,7 @@ pub enum ClientCommand {
     /// Subscribe to a remote publisher's channel.
     ///
     /// The driver will send a SETUP frame to the remote endpoint and
-    /// await SETUP_ACK/NAK. On success, DATA frames from the remote
+    /// await `SETUP_ACK`/`NAK`. On success, DATA frames from the remote
     /// publisher will be routed to the client's RX queue.
     SubscribeRemote {
         /// Local channel ID for this subscription.
@@ -200,9 +200,9 @@ pub enum ClientCommand {
     CloseChannel(ChannelId),
 }
 
-/// Remote endpoint representation for IPC (must be SharedMemorySafe).
+/// Remote endpoint representation for IPC (must be `SharedMemorySafe`).
 ///
-/// We store the raw bytes of a socket address since SocketAddr isn't repr(C).
+/// We store the raw bytes of a socket address since `SocketAddr` isn't `repr(C)`.
 #[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct RemoteEndpoint {

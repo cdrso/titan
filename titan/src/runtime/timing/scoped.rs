@@ -31,6 +31,9 @@ where
     U: TimeUnit + Now,
 {
     /// Schedules `payload` to fire after `delay` from the current time.
+    ///
+    /// # Errors
+    /// Returns `WheelError::Capacity` if the wheel is full.
     pub fn schedule_after(
         &mut self,
         delay: Duration<U>,
@@ -40,6 +43,9 @@ where
     }
 
     /// Schedules `payload` to fire after `delay` from an explicit instant.
+    ///
+    /// # Errors
+    /// Returns `WheelError::Capacity` if the wheel is full.
     pub fn schedule_at(
         &mut self,
         now: MonoInstant<U>,

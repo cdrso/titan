@@ -8,7 +8,7 @@ use crate::control::types::{
 use crate::data::{DEFAULT_FRAME_CAP, Frame, MessageReceiver, MessageSender, Wire};
 use crate::ipc::shmem::{Creator, ShmPath};
 use crate::ipc::spsc::{Consumer, Producer, Timeout};
-use crate::trace::{debug, info, warn};
+use crate::trace::{debug, info};
 use minstant::Instant;
 use std::cell::RefCell;
 use std::collections::VecDeque;

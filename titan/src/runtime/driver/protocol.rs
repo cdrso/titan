@@ -17,8 +17,8 @@
 //!
 //! Frame types:
 //! - 0x01 = SETUP (subscriber → publisher)
-//! - 0x02 = SETUP_ACK (publisher → subscriber)
-//! - 0x03 = SETUP_NAK (publisher → subscriber)
+//! - 0x02 = `SETUP_ACK` (publisher → subscriber)
+//! - 0x03 = `SETUP_NAK` (publisher → subscriber)
 //! - 0x04 = SM - Status Message (subscriber → publisher)
 //! - 0x05 = TEARDOWN (either direction)
 //!
@@ -31,7 +31,7 @@
 //! All protocol frames travel directly between driver endpoints.
 //!
 //! ## Multicast (Future)
-//! - SETUP/SETUP_ACK/SETUP_NAK: Always unicast (subscriber knows publisher address)
+//! - SETUP/`SETUP_ACK`/`SETUP_NAK`: Always unicast (subscriber knows publisher address)
 //! - SM: Unicast back to publisher (like Aeron)
 //! - DATA: Goes to multicast group address
 //! - TEARDOWN: Unicast
@@ -59,6 +59,7 @@ pub enum FrameKind {
 impl FrameKind {
     /// Classify a frame based on its first byte.
     #[inline]
+    #[must_use]
     pub const fn from_first_byte(byte: u8) -> Self {
         if byte >= 0x10 {
             Self::Protocol(byte)
@@ -69,6 +70,7 @@ impl FrameKind {
 
     /// Returns the raw type byte.
     #[inline]
+    #[must_use]
     pub const fn type_byte(self) -> u8 {
         match self {
             Self::Data(b) | Self::Protocol(b) => b,
@@ -92,6 +94,7 @@ pub mod frame_type {
 
     /// Classify frame type from first byte.
     #[inline]
+    #[must_use]
     pub const fn classify(first_byte: u8) -> FrameKind {
         FrameKind::from_first_byte(first_byte)
     }
@@ -109,7 +112,7 @@ pub const HEADER_SIZE: usize = 8;
 /// Session identifier for correlating protocol exchanges.
 ///
 /// Generated randomly by the subscriber when initiating SETUP.
-/// Echoed by the publisher in SETUP_ACK/SETUP_NAK.
+/// Echoed by the publisher in `SETUP_ACK`/`SETUP_NAK`.
 ///
 /// Invariant: Opaque. Generated via `SessionId::generate()`, never user-constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -123,6 +126,7 @@ impl SessionId {
     }
 
     /// Raw value for wire serialization.
+    #[must_use]
     pub const fn as_u32(self) -> u32 {
         self.0
     }
@@ -157,6 +161,7 @@ impl ReceiverWindow {
         Self(bytes)
     }
 
+    #[must_use]
     pub const fn as_u32(self) -> u32 {
         self.0
     }
@@ -185,14 +190,14 @@ impl Mtu {
     #[must_use]
     pub fn new(bytes: u16) -> Self {
         assert!(
-            bytes >= Self::MIN && bytes <= Self::MAX,
-            "MTU must be in range [{}, {}]",
-            Self::MIN,
-            Self::MAX
+            bytes >= Self::MIN,
+            "MTU must be >= {} (minimum IP MTU)",
+            Self::MIN
         );
         Self(bytes)
     }
 
+    #[must_use]
     pub const fn as_u16(self) -> u16 {
         self.0
     }
@@ -213,6 +218,7 @@ pub struct ConsumptionOffset(u64);
 impl ConsumptionOffset {
     pub const ZERO: Self = Self(0);
 
+    #[must_use]
     pub const fn as_u64(self) -> u64 {
         self.0
     }
@@ -278,7 +284,7 @@ pub struct SetupFrame {
     pub mtu: Mtu,
 }
 
-/// SETUP_ACK frame: publisher accepts the subscription.
+/// `SETUP_ACK` frame: publisher accepts the subscription.
 ///
 /// ```text
 /// ┌──────────────────────────────────────────────────────────────────┐
@@ -299,7 +305,7 @@ pub struct SetupAckFrame {
     pub mtu: Mtu,
 }
 
-/// SETUP_NAK frame: publisher rejects the subscription.
+/// `SETUP_NAK` frame: publisher rejects the subscription.
 ///
 /// ```text
 /// ┌──────────────────────────────────────────────────────────────────┐
@@ -436,7 +442,7 @@ impl<'a> FrameReader<'a> {
         Self { buf, cursor: 0 }
     }
 
-    fn remaining(&self) -> usize {
+    const fn remaining(&self) -> usize {
         self.buf.len() - self.cursor
     }
 
@@ -495,6 +501,9 @@ impl<'a> FrameReader<'a> {
 /// Encode a protocol frame into the buffer.
 ///
 /// The buffer is cleared and reused (preserves capacity).
+///
+/// # Errors
+/// Currently infallible but returns `Result` for future extensibility.
 pub fn encode_frame(frame: &ProtocolFrame, buf: &mut Vec<u8>) -> Result<(), ProtocolError> {
     let mut w = FrameWriter::new(buf);
 
@@ -534,6 +543,9 @@ pub fn encode_frame(frame: &ProtocolFrame, buf: &mut Vec<u8>) -> Result<(), Prot
 }
 
 /// Decode a protocol frame from bytes.
+///
+/// # Errors
+/// Returns `ProtocolError` if the buffer is malformed or too small.
 pub fn decode_frame(bytes: &[u8]) -> Result<ProtocolFrame, ProtocolError> {
     let mut r = FrameReader::new(bytes);
 

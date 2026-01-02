@@ -70,7 +70,7 @@ where
     /// Maximum delay (in ticks) that can be scheduled.
     #[inline]
     #[must_use]
-    pub const fn max_tick_span(&self) -> TickSpan {
+    pub const fn max_tick_span() -> TickSpan {
         // Single-level wheel covers one full rotation.
         TickSpan::new((SLOTS as u64).saturating_sub(1))
     }
@@ -97,7 +97,7 @@ where
         let now_tick = self.tick_from_instant(now);
         let ticks_needed = delay.div_ceil(Duration::from(self.tick_duration));
         let ticks_ahead = TickSpan::new(ticks_needed.max(1));
-        let max_delay = self.max_tick_span();
+        let max_delay = Self::max_tick_span();
         if ticks_ahead > max_delay {
             return Err(WheelError::DelayTooLong {
                 delay: ticks_ahead.get(),
@@ -358,7 +358,7 @@ mod tests {
     fn delay_too_long_rejected() {
         generativity::make_guard!(guard);
         let mut w = wheel_u32(guard, 1);
-        let max = w.max_tick_span();
+        let max = Wheel::<'_, u32, TestUnit, 8>::max_tick_span();
         let too_long = Duration::<TestUnit>::new(max.get() + 1);
         let err = w.schedule_after(now(), too_long, 1);
         assert!(
@@ -509,7 +509,7 @@ mod tests {
         let mut model: HashMap<TimerHandle<'_, u32, TestUnit>, TickInstant> = HashMap::new();
         let mut handles: Vec<TimerHandle<'_, u32, TestUnit>> = Vec::new();
         let mut now_units: u64 = 0;
-        let max_delay_units = (StressWheel::max_tick_span(&w).get()) * TICK_DURATION;
+        let max_delay_units = (StressWheel::max_tick_span().get()) * TICK_DURATION;
 
         // Helper to convert time units to tick instant (mirrors wheel logic).
         let to_tick = |units: u64| TickInstant::new(units / TICK_DURATION);

@@ -1,7 +1,7 @@
 //! Network endpoint types.
 //!
 //! These types are intentionally backend-agnostic and will be reused
-//! when kernel-bypass transports (DPDK, AF_XDP) are added.
+//! when kernel-bypass transports (DPDK, `AF_XDP`) are added.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 

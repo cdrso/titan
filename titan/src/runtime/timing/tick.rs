@@ -34,7 +34,7 @@ impl TickInstant {
     /// Overflow is treated as an impossible invariant and is not checked in release builds.
     #[inline]
     #[must_use]
-    pub fn add_span(self, span: TickSpan) -> Self {
+    pub const fn add_span(self, span: TickSpan) -> Self {
         Self(self.0 + span.0)
     }
 }

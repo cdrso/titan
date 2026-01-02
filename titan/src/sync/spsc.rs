@@ -63,7 +63,7 @@ struct HeapRing<T, const N: usize> {
 }
 
 impl<T, const N: usize> HeapRing<T, N> {
-    /// Initializes a HeapRing in uninitialized memory.
+    /// Initializes a `HeapRing` in uninitialized memory.
     ///
     /// Mirrors `IpcQueue::init_shared` pattern to avoid stack intermediary.
     ///

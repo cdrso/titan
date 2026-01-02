@@ -48,8 +48,8 @@ pub fn client_connect(
             info!(client_id = %id, "client connected successfully");
             Ok(ControlConnection { id, tx, rx })
         }
-        Some(msg) => {
-            warn!(client_id = %id, msg = ?msg, "unexpected message during handshake");
+        Some(_msg) => {
+            warn!(client_id = %id, msg = ?_msg, "unexpected message during handshake");
             Err(ConnectionError::ProtocolViolation)
         }
         None => {

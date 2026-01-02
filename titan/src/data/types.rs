@@ -38,6 +38,7 @@ impl SeqNum {
 
     /// Raw value for wire serialization only.
     #[inline]
+    #[must_use]
     pub const fn as_u64(self) -> u64 {
         self.0
     }

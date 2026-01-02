@@ -106,7 +106,7 @@ pub enum TxCommand {
 
     /// Send a protocol frame to a remote endpoint.
     ///
-    /// Used for SETUP_ACK, SETUP_NAK, and outgoing SETUP frames.
+    /// Used for `SETUP_ACK`, `SETUP_NAK`, and outgoing SETUP frames.
     SendProtocolFrame {
         /// Destination endpoint.
         endpoint: Endpoint,
@@ -224,7 +224,7 @@ pub enum RxToControlEvent {
         mtu: u16,
     },
 
-    /// Incoming SETUP_ACK from a remote publisher (subscription accepted).
+    /// Incoming `SETUP_ACK` from a remote publisher (subscription accepted).
     SetupAck {
         /// Source endpoint of the publisher.
         from: Endpoint,
@@ -236,7 +236,7 @@ pub enum RxToControlEvent {
         mtu: u16,
     },
 
-    /// Incoming SETUP_NAK from a remote publisher (subscription rejected).
+    /// Incoming `SETUP_NAK` from a remote publisher (subscription rejected).
     SetupNak {
         /// Source endpoint of the publisher.
         from: Endpoint,

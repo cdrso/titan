@@ -21,11 +21,11 @@
 //! SessionId                   → connection instance correlation
 //! ```
 //!
-//! - **ChannelId**: Application-defined stream identifier (like Aeron's streamId).
+//! - **`ChannelId`**: Application-defined stream identifier (like Aeron's streamId).
 //!   Same type can have multiple channels (e.g., two price feeds for different exchanges).
-//! - **TypeId**: Structural hash of the message type. Used for validation, not identification.
+//! - **`TypeId`**: Structural hash of the message type. Used for validation, not identification.
 //!   Publisher NAKs subscription if type hash doesn't match.
-//! - **SessionId**: Random per-subscription, used to correlate SETUP/ACK and subsequent messages.
+//! - **`SessionId`**: Random per-subscription, used to correlate SETUP/ACK and subsequent messages.
 //!
 //! ## Handshake Flow (Unicast)
 //!
@@ -57,8 +57,8 @@
 //! | Type | Direction | Purpose |
 //! |------|-----------|---------|
 //! | SETUP | Sub → Pub | Initiate subscription with type validation |
-//! | SETUP_ACK | Pub → Sub | Accept subscription, begin data flow |
-//! | SETUP_NAK | Pub → Sub | Reject (type mismatch, channel not found, etc.) |
+//! | `SETUP_ACK` | Pub → Sub | Accept subscription, begin data flow |
+//! | `SETUP_NAK` | Pub → Sub | Reject (type mismatch, channel not found, etc.) |
 //! | DATA | Pub → Sub | Application payload |
 //! | SM (Status Message) | Sub → Pub | Flow control: consumption progress + receiver window |
 //! | TEARDOWN | Either | Close subscription gracefully |
@@ -99,7 +99,7 @@
 //! 2. **Single RTT setup**: Like Aeron (SETUP → SM → streaming). Minimal latency.
 //!
 //! 3. **Type validation on SETUP only**: Zero per-message type checking overhead.
-//!    The TypeId hash ensures wire format compatibility before data flows.
+//!    The `TypeId` hash ensures wire format compatibility before data flows.
 //!
 //! 4. **Minimal header overhead**: 8-byte base header vs Aeron's ~32 bytes.
 //!
@@ -197,10 +197,12 @@ impl Driver {
     /// Spawns the driver threads.
     ///
     /// # Errors
-    ///
     /// Returns an error if:
     /// - The UDP socket cannot be bound
     /// - The driver inbox already exists (another driver is running)
+    ///
+    /// # Panics
+    /// Panics if thread spawning fails.
     pub fn spawn(config: DriverConfig) -> Result<Self, DriverError> {
         info!(
             bind_addr = %config.bind_addr,

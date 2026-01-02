@@ -5,7 +5,7 @@
 //! - Drain client→driver SPSC queues and send to network endpoints.
 //! - Apply control commands to update routing table.
 //! - Manage remote subscribers and their flow control state.
-//! - Send protocol frames (SETUP_ACK, SETUP_NAK, etc.) on behalf of control thread.
+//! - Send protocol frames (`SETUP_ACK`, `SETUP_NAK`, etc.) on behalf of control thread.
 //! - Process RX→TX events for reliability feedback.
 //!
 //! # Scheduling
@@ -65,7 +65,7 @@ struct SubscriberState {
 /// Configuration for the TX thread.
 ///
 /// Invariant: All values > 0.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct TxConfig {
     /// Maximum messages to drain per channel per tick.
     /// Exploits SPSC cache locality by batching reads from a single queue.
@@ -87,10 +87,12 @@ impl TxConfig {
         Self { batch_size, max_messages_per_tick }
     }
 
+    #[must_use]
     pub const fn batch_size(&self) -> usize {
         self.batch_size
     }
 
+    #[must_use]
     pub const fn max_messages_per_tick(&self) -> usize {
         self.max_messages_per_tick
     }
@@ -113,7 +115,7 @@ pub struct TxThread {
     /// Per-channel routing state (keyed for O(1) lookup).
     channels: HashMap<ChannelId, ChannelState>,
     /// Stable-order list of channel IDs for fair round-robin scheduling.
-    /// Maintained separately from HashMap to ensure deterministic iteration order.
+    /// Maintained separately from `HashMap` to ensure deterministic iteration order.
     channel_order: Vec<ChannelId>,
     /// Reusable buffer for encoding messages.
     encode_buf: Vec<u8>,
@@ -195,11 +197,11 @@ impl TxThread {
                     channel,
                     queue,
                     endpoints,
-                    client,
+                    client: _client,
                 } => {
                     info!(
                         channel = %channel,
-                        client = %client,
+                        client = %_client,
                         endpoints = ?endpoints,
                         "TX: adding channel"
                     );
@@ -223,10 +225,10 @@ impl TxThread {
                     // Remove from order list (maintains relative order of remaining channels)
                     self.channel_order.retain(|&id| id != channel);
                     // Adjust round_robin_offset if it now points past the end
-                    if !self.channel_order.is_empty() {
-                        self.round_robin_offset %= self.channel_order.len();
-                    } else {
+                    if self.channel_order.is_empty() {
                         self.round_robin_offset = 0;
+                    } else {
+                        self.round_robin_offset %= self.channel_order.len();
                     }
                 }
                 TxCommand::UpdateEndpoints { channel, endpoints } => {
@@ -357,7 +359,7 @@ impl TxThread {
         self.round_robin_offset = (self.round_robin_offset + 1) % num_channels;
     }
 
-    /// Drains a single channel up to `limit` messages (capped by batch_size).
+    /// Drains a single channel up to `limit` messages (capped by `batch_size`).
     ///
     /// Returns the number of messages actually sent.
     fn drain_channel(&mut self, channel_id: ChannelId, limit: usize) -> usize {
@@ -366,15 +368,13 @@ impl TxThread {
 
         for _ in 0..max_to_send {
             // Get mutable reference to channel state
-            let state = match self.channels.get_mut(&channel_id) {
-                Some(s) => s,
-                None => return sent,
+            let Some(state) = self.channels.get_mut(&channel_id) else {
+                return sent;
             };
 
             // Pop frame from client queue
-            let frame = match state.queue.pop() {
-                Some(f) => f,
-                None => return sent,
+            let Some(frame) = state.queue.pop() else {
+                return sent;
             };
 
             // Assign sequence number and timestamp
