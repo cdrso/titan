@@ -200,16 +200,6 @@ pub struct Producer<T: SharedMemorySafe, const N: usize, Mode: ShmMode> {
     _unsync: PhantomUnsync,
 }
 
-struct CapacityCheck<const N: usize>;
-
-impl<const N: usize> CapacityCheck<N> {
-    /// Compile-time assertion that queue capacity is a power of two.
-    const OK: () = assert!(
-        N.is_power_of_two(),
-        "MPSC queue capacity must be a power of two"
-    );
-}
-
 impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Creator> {
     /// Creates a new queue and returns a producer end.
     ///
@@ -219,8 +209,6 @@ impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Creator> {
     ///
     /// `EEXIST` (path exists), `EACCES` (permissions), `ENOMEM` (resources).
     pub fn create(path: ShmPath) -> Result<Self, ShmError> {
-        let () = CapacityCheck::<N>::OK;
-
         let shm = Shm::<IpcQueue<T, N>, Creator>::create(path, |uninit| {
             IpcQueue::<T, N>::init_shared(uninit);
         })?;
@@ -241,8 +229,6 @@ impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Opener> {
     ///
     /// `ENOENT` (doesn't exist), `EACCES` (permissions), size mismatch, init timeout.
     pub fn open(path: ShmPath) -> Result<Self, ShmError> {
-        let () = CapacityCheck::<N>::OK;
-
         let shm = Shm::<IpcQueue<T, N>, Opener>::open(path.clone())?;
         // SAFETY: Shm::open guarantees the pointer is valid and mapped.
         let Some(_proof) = (unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) }) else {
@@ -323,7 +309,6 @@ impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Creator> {
     ///
     /// See [`Producer::create`].
     pub fn create(path: ShmPath) -> Result<Self, ShmError> {
-        let () = CapacityCheck::<N>::OK;
         let shm = Shm::<IpcQueue<T, N>, Creator>::create(path, |uninit| {
             IpcQueue::<T, N>::init_shared(uninit);
         })?;
@@ -341,7 +326,6 @@ impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Opener> {
     ///
     /// See [`Producer::open`].
     pub fn open(path: ShmPath) -> Result<Self, ShmError> {
-        let () = CapacityCheck::<N>::OK;
         let shm = Shm::<IpcQueue<T, N>, Opener>::open(path.clone())?;
         // SAFETY: Shm::open guarantees the pointer is valid and mapped.
         let Some(_proof) = (unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) }) else {

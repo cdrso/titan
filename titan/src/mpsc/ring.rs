@@ -115,16 +115,6 @@ pub struct Ring<T, const N: usize> {
 }
 
 impl<T, const N: usize> Ring<T, N> {
-    /// Mask for converting position to slot index.
-    /// Only valid when N is a power of two.
-    const MASK: usize = N - 1;
-
-    /// Compile-time check that N is a power of two.
-    const _POWER_OF_TWO: () = assert!(
-        N.is_power_of_two(),
-        "MPSC ring capacity must be a power of two"
-    );
-
     /// Attempts to push an item onto the queue.
     ///
     /// This operation is lock-free for producers. Multiple producers can
@@ -140,12 +130,9 @@ impl<T, const N: usize> Ring<T, N> {
     /// Caller must ensure the ring has been properly initialized.
     #[inline]
     pub(crate) unsafe fn push(&self, item: T) -> Result<(), T> {
-        // Ensure compile-time check is evaluated
-        let () = Self::_POWER_OF_TWO;
-
         loop {
             let pos = self.producer.head.load(Ordering::Relaxed);
-            let slot_idx = pos & Self::MASK;
+            let slot_idx = pos % N;
             let slot = &self.buffer[slot_idx];
 
             let seq = slot.seq.load(Ordering::Acquire);
@@ -199,10 +186,8 @@ impl<T, const N: usize> Ring<T, N> {
     /// - The ring has been properly initialized
     #[inline]
     pub(crate) unsafe fn pop(&self) -> Option<T> {
-        let () = Self::_POWER_OF_TWO;
-
         let tail = self.consumer.tail.load(Ordering::Relaxed);
-        let slot_idx = tail & Self::MASK;
+        let slot_idx = tail % N;
         let slot = &self.buffer[slot_idx];
 
         let seq = slot.seq.load(Ordering::Acquire);
