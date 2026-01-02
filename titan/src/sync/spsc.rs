@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use minstant::Instant;
 
-use crate::spsc::ring::{ConsumerState, ProducerState, Ring, Slot};
+use crate::spsc::ring::{ConsumerState, ProducerState, Ring};
 
 /// Timeout specification for blocking operations.
 #[derive(Debug, Clone, Copy)]
@@ -63,19 +63,37 @@ struct HeapRing<T, const N: usize> {
 }
 
 impl<T, const N: usize> HeapRing<T, N> {
-    /// Creates a new initialized ring buffer.
-    fn new() -> Self {
-        // Initialize producer and consumer state
-        // Buffer slots start as MaybeUninit (uninitialized is fine)
-        Self {
-            ring: Ring {
-                producer: ProducerState::new(),
-                consumer: ConsumerState::new(),
-                _padding: [0u8; 64],
-                // SAFETY: MaybeUninit doesn't require initialization
-                buffer: unsafe { MaybeUninit::<[Slot<T>; N]>::uninit().assume_init() },
-            },
+    /// Initializes a HeapRing in uninitialized memory.
+    ///
+    /// Mirrors `IpcQueue::init_shared` pattern to avoid stack intermediary.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure exclusive access to `uninit` during initialization.
+    fn init_in_place(uninit: &mut MaybeUninit<Self>) {
+        let ptr = uninit.as_mut_ptr();
+        // SAFETY: We have exclusive access to uninit memory.
+        // We initialize each field that requires initialization.
+        // buffer contains MaybeUninit<T> slots - no init required.
+        unsafe {
+            std::ptr::addr_of_mut!((*ptr).ring.producer).write(ProducerState::new());
+            std::ptr::addr_of_mut!((*ptr).ring.consumer).write(ConsumerState::new());
+            // _padding and buffer don't require initialization
         }
+    }
+
+    /// Creates a new ring buffer directly on the heap.
+    ///
+    /// Uses `Box::new_uninit()` to avoid stack intermediary for large N.
+    fn new_boxed() -> Box<Self> {
+        let mut boxed = Box::<Self>::new_uninit();
+        Self::init_in_place(&mut boxed);
+        // SAFETY: init_in_place fully initializes all fields that require it.
+        // - ring.producer: initialized via addr_of_mut!
+        // - ring.consumer: initialized via addr_of_mut!
+        // - ring._padding: padding bytes, no init required
+        // - ring.buffer: [Slot<T>; N] where Slot contains MaybeUninit<T>
+        unsafe { boxed.assume_init() }
     }
 }
 
@@ -142,7 +160,7 @@ impl<const N: usize> CapacityCheck<N> {
 pub fn channel<T: Send, const N: usize>() -> (Producer<T, N>, Consumer<T, N>) {
     let () = CapacityCheck::<N>::OK;
 
-    let ring = Arc::new(HeapRing::new());
+    let ring = Arc::from(HeapRing::new_boxed());
 
     let producer = Producer {
         ring: Arc::clone(&ring),

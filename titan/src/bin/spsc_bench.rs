@@ -17,7 +17,7 @@ use titan::ipc::shmem::ShmPath;
 use titan::ipc::spsc as ipc_spsc;
 use titan::sync::spsc as sync_spsc;
 
-const QUEUE_SIZE: usize = 10_000_000;
+const QUEUE_SIZE: usize = 1_048_576; // 1M - fits in stack for sync version
 const ITERATIONS: usize = 10_000_000;
 
 type Payload = i32;

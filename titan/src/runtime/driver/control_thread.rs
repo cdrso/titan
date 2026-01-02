@@ -33,7 +33,8 @@ use super::commands::{
     RxToControlEvent, TxCommand,
 };
 use super::protocol::{
-    NakReason, ProtocolFrame, SessionId, SetupAckFrame, SetupFrame, SetupNakFrame, encode_frame,
+    Mtu, NakReason, ProtocolFrame, ReceiverWindow, SessionId, SetupAckFrame, SetupFrame,
+    SetupNakFrame, encode_frame,
 };
 
 type DriverConnection = ControlConnection<DriverRole>;
@@ -326,7 +327,7 @@ impl ControlThread {
         let frame = ProtocolFrame::SetupAck(SetupAckFrame {
             session: subscriber_session,
             publisher_session,
-            mtu,
+            mtu: Mtu::new(mtu),
         });
 
         if encode_frame(&frame, &mut self.encode_buf).is_ok() {
@@ -334,7 +335,9 @@ impl ControlThread {
                 endpoint: to,
                 frame_bytes: self.encode_buf.clone(),
             };
-            let _ = self.tx_commands.push(cmd);
+            if self.tx_commands.push(cmd).is_err() {
+                warn!(endpoint = %to, "TX command queue full, dropping SETUP_ACK");
+            }
         }
     }
 
@@ -347,7 +350,9 @@ impl ControlThread {
                 endpoint: to,
                 frame_bytes: self.encode_buf.clone(),
             };
-            let _ = self.tx_commands.push(cmd);
+            if self.tx_commands.push(cmd).is_err() {
+                warn!(endpoint = %to, "TX command queue full, dropping SETUP_NAK");
+            }
         }
     }
 
@@ -359,7 +364,9 @@ impl ControlThread {
                 channel: *channel,
                 session,
             };
-            let _ = self.tx_commands.push(cmd);
+            if self.tx_commands.push(cmd).is_err() {
+                warn!(channel = %channel, session = %session, "TX command queue full, dropping RemoveSubscriber");
+            }
         }
     }
 
@@ -421,17 +428,27 @@ impl ControlThread {
             endpoint: from,
             channel: pending.remote_channel,
         };
-        let _ = self.rx_commands.push(RxCommand::AddRemoteMapping {
-            remote: remote_key,
-            local_channel: pending.local_channel,
-        });
+        if self
+            .rx_commands
+            .push(RxCommand::AddRemoteMapping {
+                remote: remote_key,
+                local_channel: pending.local_channel,
+            })
+            .is_err()
+        {
+            warn!(channel = %pending.local_channel, "RX command queue full, dropping AddRemoteMapping");
+        }
 
         // Notify the client that subscription is ready
         if let Some(session) = self.sessions.get(&pending.client) {
-            let _ = session
+            if session
                 .conn
                 .tx
-                .push(DriverMessage::SubscriptionReady(pending.local_channel));
+                .push(DriverMessage::SubscriptionReady(pending.local_channel))
+                .is_err()
+            {
+                warn!(client = %pending.client, channel = %pending.local_channel, "client queue full, dropping SubscriptionReady");
+            }
         }
     }
 
@@ -466,10 +483,17 @@ impl ControlThread {
 
         // Notify the client that subscription failed
         if let Some(session) = self.sessions.get(&pending.client) {
-            let _ = session.conn.tx.push(DriverMessage::SubscriptionFailed {
-                channel: pending.local_channel,
-                reason: failure,
-            });
+            if session
+                .conn
+                .tx
+                .push(DriverMessage::SubscriptionFailed {
+                    channel: pending.local_channel,
+                    reason: failure,
+                })
+                .is_err()
+            {
+                warn!(client = %pending.client, channel = %pending.local_channel, "client queue full, dropping SubscriptionFailed");
+            }
         }
     }
 
@@ -513,8 +537,8 @@ impl ControlThread {
             session,
             channel: remote_channel,
             type_id,
-            receiver_window: 128 * 1024, // 128KB default
-            mtu: 1500,
+            receiver_window: ReceiverWindow::new(128 * 1024), // 128KB default
+            mtu: Mtu::new(1500),
         });
 
         if encode_frame(&frame, &mut self.encode_buf).is_ok() {
@@ -522,7 +546,9 @@ impl ControlThread {
                 endpoint: remote_endpoint,
                 frame_bytes: self.encode_buf.clone(),
             };
-            let _ = self.tx_commands.push(cmd);
+            if self.tx_commands.push(cmd).is_err() {
+                warn!(endpoint = %remote_endpoint, "TX command queue full, dropping SETUP");
+            }
         }
     }
 
@@ -530,12 +556,18 @@ impl ControlThread {
     fn do_shutdown(&mut self) {
         // Notify all clients
         for session in self.sessions.values() {
-            let _ = session.conn.tx.push(DriverMessage::Shutdown);
+            if session.conn.tx.push(DriverMessage::Shutdown).is_err() {
+                warn!(client = %session.conn.id, "client queue full, dropping Shutdown");
+            }
         }
 
-        // Send shutdown to TX/RX threads
-        let _ = self.tx_commands.push(TxCommand::Shutdown);
-        let _ = self.rx_commands.push(RxCommand::Shutdown);
+        // Send shutdown to TX/RX threads (best-effort during shutdown)
+        if self.tx_commands.push(TxCommand::Shutdown).is_err() {
+            warn!("TX command queue full, dropping Shutdown");
+        }
+        if self.rx_commands.push(RxCommand::Shutdown).is_err() {
+            warn!("RX command queue full, dropping Shutdown");
+        }
     }
 
     /// Accepts all pending connection requests.
@@ -629,7 +661,9 @@ impl ControlThread {
 
             // Check for timeout
             if now.duration_since(session.last_activity) > session_timeout {
-                let _ = session.conn.tx.push(DriverMessage::Shutdown);
+                if session.conn.tx.push(DriverMessage::Shutdown).is_err() {
+                    warn!(client = %session.conn.id, "client queue full, dropping Shutdown");
+                }
                 disconnected.push(session.conn.id);
             }
         }
@@ -672,7 +706,9 @@ impl ControlThread {
 
         if session.channels.contains_key(&channel) {
             warn!(client = %session.conn.id, channel = %channel, "OpenTx failed: channel already exists");
-            let _ = session.conn.tx.push(DriverMessage::ChannelError(channel));
+            if session.conn.tx.push(DriverMessage::ChannelError(channel)).is_err() {
+                warn!(client = %session.conn.id, channel = %channel, "client queue full, dropping ChannelError");
+            }
             return None;
         }
 
@@ -681,7 +717,9 @@ impl ControlThread {
             Ok(q) => q,
             Err(e) => {
                 warn!(client = %session.conn.id, channel = %channel, error = ?e, "OpenTx failed: cannot open queue");
-                let _ = session.conn.tx.push(DriverMessage::ChannelError(channel));
+                if session.conn.tx.push(DriverMessage::ChannelError(channel)).is_err() {
+                    warn!(client = %session.conn.id, channel = %channel, "client queue full, dropping ChannelError");
+                }
                 return None;
             }
         };
@@ -695,12 +733,16 @@ impl ControlThread {
         };
         if tx_commands.push(cmd).is_err() {
             warn!(client = %session.conn.id, channel = %channel, "OpenTx failed: command queue full");
-            let _ = session.conn.tx.push(DriverMessage::ChannelError(channel));
+            if session.conn.tx.push(DriverMessage::ChannelError(channel)).is_err() {
+                warn!(client = %session.conn.id, channel = %channel, "client queue full, dropping ChannelError");
+            }
             return None;
         }
 
         session.channels.insert(channel, ChannelDirection::Inbound);
-        let _ = session.conn.tx.push(DriverMessage::ChannelReady(channel));
+        if session.conn.tx.push(DriverMessage::ChannelReady(channel)).is_err() {
+            warn!(client = %session.conn.id, channel = %channel, "client queue full, dropping ChannelReady");
+        }
 
         info!(
             client = %session.conn.id,
@@ -730,7 +772,9 @@ impl ControlThread {
 
         if session.channels.contains_key(&channel) {
             warn!(client = %session.conn.id, channel = %channel, "OpenRx failed: channel already exists");
-            let _ = session.conn.tx.push(DriverMessage::ChannelError(channel));
+            if session.conn.tx.push(DriverMessage::ChannelError(channel)).is_err() {
+                warn!(client = %session.conn.id, channel = %channel, "client queue full, dropping ChannelError");
+            }
             return;
         }
 
@@ -739,7 +783,9 @@ impl ControlThread {
             Ok(q) => q,
             Err(e) => {
                 warn!(client = %session.conn.id, channel = %channel, error = ?e, "OpenRx failed: cannot open queue");
-                let _ = session.conn.tx.push(DriverMessage::ChannelError(channel));
+                if session.conn.tx.push(DriverMessage::ChannelError(channel)).is_err() {
+                    warn!(client = %session.conn.id, channel = %channel, "client queue full, dropping ChannelError");
+                }
                 return;
             }
         };
@@ -752,12 +798,16 @@ impl ControlThread {
         };
         if rx_commands.push(cmd).is_err() {
             warn!(client = %session.conn.id, channel = %channel, "OpenRx failed: command queue full");
-            let _ = session.conn.tx.push(DriverMessage::ChannelError(channel));
+            if session.conn.tx.push(DriverMessage::ChannelError(channel)).is_err() {
+                warn!(client = %session.conn.id, channel = %channel, "client queue full, dropping ChannelError");
+            }
             return;
         }
 
         session.channels.insert(channel, ChannelDirection::Outbound);
-        let _ = session.conn.tx.push(DriverMessage::ChannelReady(channel));
+        if session.conn.tx.push(DriverMessage::ChannelReady(channel)).is_err() {
+            warn!(client = %session.conn.id, channel = %channel, "client queue full, dropping ChannelReady");
+        }
 
         info!(client = %session.conn.id, channel = %channel, "RX channel opened");
     }
@@ -772,14 +822,20 @@ impl ControlThread {
         if let Some(direction) = session.channels.remove(&channel) {
             match direction {
                 ChannelDirection::Inbound => {
-                    let _ = tx_commands.push(TxCommand::RemoveChannel { channel });
+                    if tx_commands.push(TxCommand::RemoveChannel { channel }).is_err() {
+                        warn!(channel = %channel, "TX command queue full, dropping RemoveChannel");
+                    }
                 }
                 ChannelDirection::Outbound => {
-                    let _ = rx_commands.push(RxCommand::RemoveChannel { channel });
+                    if rx_commands.push(RxCommand::RemoveChannel { channel }).is_err() {
+                        warn!(channel = %channel, "RX command queue full, dropping RemoveChannel");
+                    }
                 }
             }
         }
-        let _ = session.conn.tx.push(DriverMessage::ChannelClosed(channel));
+        if session.conn.tx.push(DriverMessage::ChannelClosed(channel)).is_err() {
+            warn!(client = %session.conn.id, channel = %channel, "client queue full, dropping ChannelClosed");
+        }
     }
 
     /// Cleans up a disconnected session.
@@ -789,10 +845,14 @@ impl ControlThread {
             for (channel, direction) in session.channels {
                 match direction {
                     ChannelDirection::Inbound => {
-                        let _ = self.tx_commands.push(TxCommand::RemoveChannel { channel });
+                        if self.tx_commands.push(TxCommand::RemoveChannel { channel }).is_err() {
+                            warn!(channel = %channel, "TX command queue full, dropping RemoveChannel");
+                        }
                     }
                     ChannelDirection::Outbound => {
-                        let _ = self.rx_commands.push(RxCommand::RemoveChannel { channel });
+                        if self.rx_commands.push(RxCommand::RemoveChannel { channel }).is_err() {
+                            warn!(channel = %channel, "RX command queue full, dropping RemoveChannel");
+                        }
                     }
                 }
             }

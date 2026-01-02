@@ -63,22 +63,42 @@ struct SubscriberState {
 }
 
 /// Configuration for the TX thread.
+///
+/// Invariant: All values > 0.
 #[derive(Debug, Clone)]
 pub struct TxConfig {
     /// Maximum messages to drain per channel per tick.
     /// Exploits SPSC cache locality by batching reads from a single queue.
-    pub batch_size: usize,
+    batch_size: usize,
     /// Maximum total messages to send per tick across all channels.
     /// Bounds worst-case latency by limiting work per event loop iteration.
-    pub max_messages_per_tick: usize,
+    max_messages_per_tick: usize,
+}
+
+impl TxConfig {
+    /// Creates a new TX configuration.
+    ///
+    /// # Panics
+    /// Panics if any value is 0.
+    #[must_use]
+    pub fn new(batch_size: usize, max_messages_per_tick: usize) -> Self {
+        assert!(batch_size > 0, "batch_size must be > 0");
+        assert!(max_messages_per_tick > 0, "max_messages_per_tick must be > 0");
+        Self { batch_size, max_messages_per_tick }
+    }
+
+    pub const fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    pub const fn max_messages_per_tick(&self) -> usize {
+        self.max_messages_per_tick
+    }
 }
 
 impl Default for TxConfig {
     fn default() -> Self {
-        Self {
-            batch_size: DEFAULT_BATCH_SIZE,
-            max_messages_per_tick: DEFAULT_MAX_MESSAGES_PER_TICK,
-        }
+        Self::new(DEFAULT_BATCH_SIZE, DEFAULT_MAX_MESSAGES_PER_TICK)
     }
 }
 
@@ -255,7 +275,9 @@ impl TxThread {
                         "TX: sending protocol frame"
                     );
                     // Best-effort send of protocol frame
-                    let _ = self.socket.try_send_to(&frame_bytes, endpoint);
+                    if self.socket.try_send_to(&frame_bytes, endpoint).is_err() {
+                        trace!(endpoint = %endpoint, "send would block or failed");
+                    }
                 }
                 TxCommand::Shutdown => {
                     info!("TX: shutdown command received");
@@ -391,8 +413,10 @@ impl TxThread {
 
             // Fan-out to all endpoints (static + dynamic subscribers)
             for endpoint in &self.endpoint_buf {
-                // Best-effort send - ignore errors
-                let _ = self.socket.try_send_to(&self.encode_buf, *endpoint);
+                // Best-effort send - transient failures retried at higher layer
+                if self.socket.try_send_to(&self.encode_buf, *endpoint).is_err() {
+                    trace!(endpoint = %endpoint, "send would block or failed");
+                }
             }
 
             sent += 1;

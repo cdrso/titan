@@ -229,6 +229,18 @@ impl RemoteEndpoint {
     }
 }
 
+impl From<RemoteEndpoint> for crate::net::Endpoint {
+    fn from(remote: RemoteEndpoint) -> Self {
+        Self::new_v4(
+            remote.addr[0],
+            remote.addr[1],
+            remote.addr[2],
+            remote.addr[3],
+            remote.port,
+        )
+    }
+}
+
 /// Messages sent from client to driver.
 #[derive(SharedMemorySafe, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -239,24 +251,35 @@ pub enum ClientMessage {
     Command(ClientCommand),
 }
 
+/// Error when parsing a `ClientMessage` into a specific variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum MessageParseError {
+    /// Expected a `Hello` message, got `Command`.
+    #[error("expected Hello, got Command")]
+    ExpectedHello,
+    /// Expected a `Command` message, got `Hello`.
+    #[error("expected Command, got Hello")]
+    ExpectedCommand,
+}
+
 impl TryFrom<ClientMessage> for ClientHello {
-    type Error = ();
+    type Error = MessageParseError;
 
     fn try_from(msg: ClientMessage) -> Result<Self, Self::Error> {
         match msg {
             ClientMessage::Hello(hello) => Ok(hello),
-            ClientMessage::Command(_) => Err(()),
+            ClientMessage::Command(_) => Err(MessageParseError::ExpectedHello),
         }
     }
 }
 
 impl TryFrom<ClientMessage> for ClientCommand {
-    type Error = ();
+    type Error = MessageParseError;
 
     fn try_from(msg: ClientMessage) -> Result<Self, Self::Error> {
         match msg {
             ClientMessage::Command(cmd) => Ok(cmd),
-            ClientMessage::Hello(_) => Err(()),
+            ClientMessage::Hello(_) => Err(MessageParseError::ExpectedCommand),
         }
     }
 }

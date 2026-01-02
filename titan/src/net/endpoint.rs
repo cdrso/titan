@@ -83,18 +83,6 @@ impl std::fmt::Display for Endpoint {
     }
 }
 
-impl From<crate::control::types::RemoteEndpoint> for Endpoint {
-    fn from(remote: crate::control::types::RemoteEndpoint) -> Self {
-        Self::new_v4(
-            remote.addr[0],
-            remote.addr[1],
-            remote.addr[2],
-            remote.addr[3],
-            remote.port,
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

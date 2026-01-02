@@ -45,22 +45,55 @@ use thiserror::Error;
 
 use crate::control::types::{ChannelId, TypeId};
 
+/// Discriminated frame kind based on first byte.
+///
+/// Provides type-safe evidence of frame classification rather than a boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameKind {
+    /// Data plane frame (type byte < 0x10).
+    Data(u8),
+    /// Protocol/control frame (type byte >= 0x10).
+    Protocol(u8),
+}
+
+impl FrameKind {
+    /// Classify a frame based on its first byte.
+    #[inline]
+    pub const fn from_first_byte(byte: u8) -> Self {
+        if byte >= 0x10 {
+            Self::Protocol(byte)
+        } else {
+            Self::Data(byte)
+        }
+    }
+
+    /// Returns the raw type byte.
+    #[inline]
+    pub const fn type_byte(self) -> u8 {
+        match self {
+            Self::Data(b) | Self::Protocol(b) => b,
+        }
+    }
+}
+
 /// Protocol frame type discriminants.
 ///
 /// These start at 0x10 to avoid collision with data plane message tags (0x00-0x03).
 /// This allows the RX thread to quickly distinguish protocol frames from data frames
 /// by checking if the first byte is >= 0x10.
 pub mod frame_type {
+    use super::FrameKind;
+
     pub const SETUP: u8 = 0x10;
     pub const SETUP_ACK: u8 = 0x11;
     pub const SETUP_NAK: u8 = 0x12;
     pub const STATUS_MESSAGE: u8 = 0x13;
     pub const TEARDOWN: u8 = 0x14;
 
-    /// Returns true if the byte indicates a protocol frame (vs data plane).
+    /// Classify frame type from first byte.
     #[inline]
-    pub const fn is_protocol_frame(first_byte: u8) -> bool {
-        first_byte >= 0x10
+    pub const fn classify(first_byte: u8) -> FrameKind {
+        FrameKind::from_first_byte(first_byte)
     }
 }
 
@@ -77,8 +110,10 @@ pub const HEADER_SIZE: usize = 8;
 ///
 /// Generated randomly by the subscriber when initiating SETUP.
 /// Echoed by the publisher in SETUP_ACK/SETUP_NAK.
+///
+/// Invariant: Opaque. Generated via `SessionId::generate()`, never user-constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SessionId(pub u32);
+pub struct SessionId(u32);
 
 impl SessionId {
     /// Generate a new random session ID.
@@ -86,11 +121,106 @@ impl SessionId {
     pub fn generate() -> Self {
         Self(rand::random())
     }
+
+    /// Raw value for wire serialization.
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for SessionId {
+    fn from(v: u32) -> Self {
+        Self(v)
+    }
 }
 
 impl fmt::Display for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:08x}", self.0)
+    }
+}
+
+/// Receiver window size in bytes.
+///
+/// Invariant: Must be > 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiverWindow(u32);
+
+impl ReceiverWindow {
+    /// Creates a new receiver window.
+    ///
+    /// # Panics
+    /// Panics if `bytes == 0`.
+    #[must_use]
+    pub fn new(bytes: u32) -> Self {
+        assert!(bytes > 0, "ReceiverWindow must be > 0");
+        Self(bytes)
+    }
+
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for ReceiverWindow {
+    fn from(v: u32) -> Self {
+        Self::new(v)
+    }
+}
+
+/// Maximum transmission unit in bytes.
+///
+/// Invariant: Must be in range [68, 65535] (minimum IP MTU to max UDP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mtu(u16);
+
+impl Mtu {
+    pub const MIN: u16 = 68;    // Minimum IP MTU
+    pub const MAX: u16 = 65535; // Max UDP datagram
+
+    /// Creates a new MTU value.
+    ///
+    /// # Panics
+    /// Panics if value is outside valid range.
+    #[must_use]
+    pub fn new(bytes: u16) -> Self {
+        assert!(
+            bytes >= Self::MIN && bytes <= Self::MAX,
+            "MTU must be in range [{}, {}]",
+            Self::MIN,
+            Self::MAX
+        );
+        Self(bytes)
+    }
+
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+}
+
+impl From<u16> for Mtu {
+    fn from(v: u16) -> Self {
+        Self::new(v)
+    }
+}
+
+/// Consumption offset (bytes consumed by receiver).
+///
+/// Invariant: Monotonically increasing (caller's responsibility).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ConsumptionOffset(u64);
+
+impl ConsumptionOffset {
+    pub const ZERO: Self = Self(0);
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for ConsumptionOffset {
+    fn from(v: u64) -> Self {
+        Self(v)
     }
 }
 
@@ -143,9 +273,9 @@ pub struct SetupFrame {
     /// Expected type hash for validation.
     pub type_id: TypeId,
     /// Initial receiver window in bytes.
-    pub receiver_window: u32,
+    pub receiver_window: ReceiverWindow,
     /// Maximum transmission unit (max frame size).
-    pub mtu: u16,
+    pub mtu: Mtu,
 }
 
 /// SETUP_ACK frame: publisher accepts the subscription.
@@ -166,7 +296,7 @@ pub struct SetupAckFrame {
     /// Publisher's session ID for the subscriber to use in Status Messages.
     pub publisher_session: SessionId,
     /// Negotiated MTU (minimum of subscriber and publisher).
-    pub mtu: u16,
+    pub mtu: Mtu,
 }
 
 /// SETUP_NAK frame: publisher rejects the subscription.
@@ -207,9 +337,9 @@ pub struct StatusMessageFrame {
     /// Publisher's session ID.
     pub session: SessionId,
     /// Highest contiguous sequence number consumed by subscriber.
-    pub consumption_offset: u64,
+    pub consumption_offset: ConsumptionOffset,
     /// Current receiver window in bytes.
-    pub receiver_window: u32,
+    pub receiver_window: ReceiverWindow,
 }
 
 /// TEARDOWN frame: graceful subscription close.
@@ -282,7 +412,7 @@ impl<'a> FrameWriter<'a> {
         self.put_u8(flags);
         let len_pos = self.buf.len();
         self.put_u16(0); // placeholder for length
-        self.put_u32(session.0);
+        self.put_u32(session.as_u32());
         len_pos
     }
 
@@ -373,14 +503,14 @@ pub fn encode_frame(frame: &ProtocolFrame, buf: &mut Vec<u8>) -> Result<(), Prot
             let len_pos = w.write_header(frame_type::SETUP, 0, f.session);
             w.put_u32(f.channel.into());
             w.put_u64(f.type_id.into());
-            w.put_u32(f.receiver_window);
-            w.put_u16(f.mtu);
+            w.put_u32(f.receiver_window.as_u32());
+            w.put_u16(f.mtu.as_u16());
             w.patch_length(len_pos);
         }
         ProtocolFrame::SetupAck(f) => {
             let len_pos = w.write_header(frame_type::SETUP_ACK, 0, f.session);
-            w.put_u32(f.publisher_session.0);
-            w.put_u16(f.mtu);
+            w.put_u32(f.publisher_session.as_u32());
+            w.put_u16(f.mtu.as_u16());
             w.patch_length(len_pos);
         }
         ProtocolFrame::SetupNak(f) => {
@@ -390,8 +520,8 @@ pub fn encode_frame(frame: &ProtocolFrame, buf: &mut Vec<u8>) -> Result<(), Prot
         }
         ProtocolFrame::StatusMessage(f) => {
             let len_pos = w.write_header(frame_type::STATUS_MESSAGE, 0, f.session);
-            w.put_u64(f.consumption_offset);
-            w.put_u32(f.receiver_window);
+            w.put_u64(f.consumption_offset.as_u64());
+            w.put_u32(f.receiver_window.as_u32());
             w.patch_length(len_pos);
         }
         ProtocolFrame::Teardown(f) => {
@@ -411,14 +541,14 @@ pub fn decode_frame(bytes: &[u8]) -> Result<ProtocolFrame, ProtocolError> {
     let frame_type = r.take_u8()?;
     let _flags = r.take_u8()?;
     let _len = r.take_u16()?;
-    let session = SessionId(r.take_u32()?);
+    let session = SessionId::from(r.take_u32()?);
 
     match frame_type {
         frame_type::SETUP => {
             let channel = ChannelId::from(r.take_u32()?);
             let type_id = TypeId::from(r.take_u64()?);
-            let receiver_window = r.take_u32()?;
-            let mtu = r.take_u16()?;
+            let receiver_window = ReceiverWindow::from(r.take_u32()?);
+            let mtu = Mtu::from(r.take_u16()?);
             Ok(ProtocolFrame::Setup(SetupFrame {
                 session,
                 channel,
@@ -428,8 +558,8 @@ pub fn decode_frame(bytes: &[u8]) -> Result<ProtocolFrame, ProtocolError> {
             }))
         }
         frame_type::SETUP_ACK => {
-            let publisher_session = SessionId(r.take_u32()?);
-            let mtu = r.take_u16()?;
+            let publisher_session = SessionId::from(r.take_u32()?);
+            let mtu = Mtu::from(r.take_u16()?);
             Ok(ProtocolFrame::SetupAck(SetupAckFrame {
                 session,
                 publisher_session,
@@ -441,8 +571,8 @@ pub fn decode_frame(bytes: &[u8]) -> Result<ProtocolFrame, ProtocolError> {
             Ok(ProtocolFrame::SetupNak(SetupNakFrame { session, reason }))
         }
         frame_type::STATUS_MESSAGE => {
-            let consumption_offset = r.take_u64()?;
-            let receiver_window = r.take_u32()?;
+            let consumption_offset = ConsumptionOffset::from(r.take_u64()?);
+            let receiver_window = ReceiverWindow::from(r.take_u32()?);
             Ok(ProtocolFrame::StatusMessage(StatusMessageFrame {
                 session,
                 consumption_offset,
@@ -461,11 +591,11 @@ mod tests {
     #[test]
     fn roundtrip_setup() {
         let frame = ProtocolFrame::Setup(SetupFrame {
-            session: SessionId(0x12345678),
+            session: SessionId::from(0x12345678),
             channel: ChannelId::from(42),
             type_id: TypeId::from(0xDEADBEEF_CAFEBABE),
-            receiver_window: 128 * 1024,
-            mtu: 1500,
+            receiver_window: ReceiverWindow::new(128 * 1024),
+            mtu: Mtu::new(1500),
         });
 
         let mut buf = Vec::new();
@@ -478,9 +608,9 @@ mod tests {
     #[test]
     fn roundtrip_setup_ack() {
         let frame = ProtocolFrame::SetupAck(SetupAckFrame {
-            session: SessionId(0x11111111),
-            publisher_session: SessionId(0x22222222),
-            mtu: 1400,
+            session: SessionId::from(0x11111111),
+            publisher_session: SessionId::from(0x22222222),
+            mtu: Mtu::new(1400),
         });
 
         let mut buf = Vec::new();
@@ -493,7 +623,7 @@ mod tests {
     #[test]
     fn roundtrip_setup_nak() {
         let frame = ProtocolFrame::SetupNak(SetupNakFrame {
-            session: SessionId(0xAAAAAAAA),
+            session: SessionId::from(0xAAAAAAAA),
             reason: NakReason::TypeMismatch,
         });
 
@@ -507,9 +637,9 @@ mod tests {
     #[test]
     fn roundtrip_status_message() {
         let frame = ProtocolFrame::StatusMessage(StatusMessageFrame {
-            session: SessionId(0xBBBBBBBB),
-            consumption_offset: 999_999,
-            receiver_window: 64 * 1024,
+            session: SessionId::from(0xBBBBBBBB),
+            consumption_offset: ConsumptionOffset::from(999_999),
+            receiver_window: ReceiverWindow::new(64 * 1024),
         });
 
         let mut buf = Vec::new();
@@ -522,7 +652,7 @@ mod tests {
     #[test]
     fn roundtrip_teardown() {
         let frame = ProtocolFrame::Teardown(TeardownFrame {
-            session: SessionId(0xCCCCCCCC),
+            session: SessionId::from(0xCCCCCCCC),
         });
 
         let mut buf = Vec::new();

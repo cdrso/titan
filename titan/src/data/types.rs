@@ -8,8 +8,10 @@ use crate::control::types::ChannelId;
 use crate::runtime::timing::{Micros, MonoInstant};
 
 /// Sequence number for data frames.
+///
+/// Invariant: Opaque identifier. Only `ZERO`, `next()`, and comparison permitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-pub struct SeqNum(pub u64);
+pub struct SeqNum(u64);
 
 impl From<u64> for SeqNum {
     fn from(v: u64) -> Self {
@@ -32,6 +34,12 @@ impl SeqNum {
     #[must_use]
     pub const fn next(self) -> Self {
         Self(self.0.wrapping_add(1))
+    }
+
+    /// Raw value for wire serialization only.
+    #[inline]
+    pub const fn as_u64(self) -> u64 {
+        self.0
     }
 }
 

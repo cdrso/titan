@@ -118,6 +118,13 @@ unsafe impl<T: SharedMemorySafe, const N: usize> Send for IpcQueue<T, N> {}
 // SAFETY: IpcQueue is Sync because concurrent access is mediated by atomics.
 unsafe impl<T: SharedMemorySafe, const N: usize> Sync for IpcQueue<T, N> {}
 
+/// Zero-sized proof that initialization succeeded.
+///
+/// This type can only be constructed by successfully waiting for init,
+/// providing compile-time evidence that the queue is ready for use.
+#[derive(Debug, Clone, Copy)]
+struct InitProof(());
+
 impl<T: SharedMemorySafe, const N: usize> IpcQueue<T, N> {
     /// Initializes the queue directly inside shared memory.
     ///
@@ -150,22 +157,26 @@ impl<T: SharedMemorySafe, const N: usize> IpcQueue<T, N> {
 
     /// Spins until the queue is initialized or timeout expires.
     ///
+    /// Returns `Some(InitProof)` on success, `None` on timeout.
+    /// The proof guarantees the queue has been initialized.
+    ///
     /// # Safety
     ///
     /// Caller must ensure:
     /// - **Pointer validity**: `ptr` points to mapped shared memory
     /// - **Lifetime**: The memory remains mapped for the duration of this call
-    unsafe fn wait_for_init(ptr: *const Self, timeout: std::time::Duration) -> bool {
+    unsafe fn wait_for_init(ptr: *const Self, timeout: std::time::Duration) -> Option<InitProof> {
         use std::sync::atomic::Ordering;
 
         let start = std::time::Instant::now();
         loop {
             if unsafe { (*ptr).init.0.load(Ordering::Acquire) } == INIT_MAGIC {
-                return true;
+                return Some(InitProof(()));
             }
             if start.elapsed() >= timeout {
-                return false;
+                return None;
             }
+            std::hint::spin_loop();
         }
     }
 }
@@ -234,9 +245,10 @@ impl<T: SharedMemorySafe, const N: usize> Producer<T, N, Opener> {
 
         let shm = Shm::<IpcQueue<T, N>, Opener>::open(path.clone())?;
         // SAFETY: Shm::open guarantees the pointer is valid and mapped.
-        if !unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) } {
-            return Err(ShmError::InitTimeout { path: path.into() });
-        }
+        let _proof = match unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) } {
+            Some(proof) => proof,
+            None => return Err(ShmError::InitTimeout { path: path.into() }),
+        };
         Ok(Self {
             shm,
             _unsync: PhantomData,
@@ -333,9 +345,10 @@ impl<T: SharedMemorySafe, const N: usize> Consumer<T, N, Opener> {
         let () = CapacityCheck::<N>::OK;
         let shm = Shm::<IpcQueue<T, N>, Opener>::open(path.clone())?;
         // SAFETY: Shm::open guarantees the pointer is valid and mapped.
-        if !unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) } {
-            return Err(ShmError::InitTimeout { path: path.into() });
-        }
+        let _proof = match unsafe { IpcQueue::<T, N>::wait_for_init(&raw const *shm, INIT_TIMEOUT) } {
+            Some(proof) => proof,
+            None => return Err(ShmError::InitTimeout { path: path.into() }),
+        };
         Ok(Self {
             shm,
             _unsync: PhantomData,

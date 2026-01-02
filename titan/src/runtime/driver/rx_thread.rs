@@ -21,7 +21,7 @@ use super::commands::{
     COMMAND_QUEUE_CAPACITY, ClientRxQueue, DEFAULT_FRAME_CAP, RemoteStreamKey, RxCommand,
     RxToControlEvent, RxToTxEvent,
 };
-use super::protocol::{ProtocolFrame, decode_frame, frame_type};
+use super::protocol::{FrameKind, ProtocolFrame, decode_frame, frame_type};
 
 /// Maximum UDP datagram size we'll receive.
 const MAX_DATAGRAM_SIZE: usize = 65535;
@@ -163,16 +163,12 @@ impl RxThread {
             return;
         }
 
-        // Check first byte to distinguish protocol frames from data frames.
-        // Protocol frames have type >= 0x10, data frames have type 0x00-0x03.
-        let is_protocol = frame_type::is_protocol_frame(self.recv_buf[0]);
-
         let from_endpoint = Endpoint::from(from);
 
-        if is_protocol {
-            self.handle_protocol_frame(len, from_endpoint);
-        } else {
-            self.handle_data_frame(len, from_endpoint);
+        // Classify frame type from first byte - produces typed evidence
+        match frame_type::classify(self.recv_buf[0]) {
+            FrameKind::Protocol(_) => self.handle_protocol_frame(len, from_endpoint),
+            FrameKind::Data(_) => self.handle_data_frame(len, from_endpoint),
         }
     }
 
@@ -200,10 +196,12 @@ impl RxThread {
                     session: setup.session,
                     channel: setup.channel,
                     type_id: setup.type_id,
-                    receiver_window: setup.receiver_window,
-                    mtu: setup.mtu,
+                    receiver_window: setup.receiver_window.as_u32(),
+                    mtu: setup.mtu.as_u16(),
                 };
-                let _ = self.control_events.push(event);
+                if self.control_events.push(event).is_err() {
+                    warn!(from = %from, "control event queue full, dropping SETUP");
+                }
             }
             ProtocolFrame::SetupAck(ack) => {
                 debug!(
@@ -216,9 +214,11 @@ impl RxThread {
                     from,
                     session: ack.session,
                     publisher_session: ack.publisher_session,
-                    mtu: ack.mtu,
+                    mtu: ack.mtu.as_u16(),
                 };
-                let _ = self.control_events.push(event);
+                if self.control_events.push(event).is_err() {
+                    warn!(from = %from, "control event queue full, dropping SETUP_ACK");
+                }
             }
             ProtocolFrame::SetupNak(nak) => {
                 debug!(
@@ -232,22 +232,26 @@ impl RxThread {
                     session: nak.session,
                     reason: nak.reason,
                 };
-                let _ = self.control_events.push(event);
+                if self.control_events.push(event).is_err() {
+                    warn!(from = %from, "control event queue full, dropping SETUP_NAK");
+                }
             }
             ProtocolFrame::StatusMessage(sm) => {
                 trace!(
                     session = %sm.session,
-                    consumption_offset = sm.consumption_offset,
-                    receiver_window = sm.receiver_window,
+                    consumption_offset = sm.consumption_offset.as_u64(),
+                    receiver_window = sm.receiver_window.as_u32(),
                     "RX: received StatusMessage"
                 );
                 // Status messages go to TX thread for flow control
                 let event = RxToTxEvent::StatusMessage {
                     session: sm.session,
-                    consumption_offset: sm.consumption_offset,
-                    receiver_window: sm.receiver_window,
+                    consumption_offset: sm.consumption_offset.as_u64(),
+                    receiver_window: sm.receiver_window.as_u32(),
                 };
-                let _ = self.tx_events.push(event);
+                if self.tx_events.push(event).is_err() {
+                    warn!(session = %sm.session, "TX event queue full, dropping StatusMessage");
+                }
             }
             ProtocolFrame::Teardown(teardown) => {
                 debug!(from = %from, session = %teardown.session, "RX: received TEARDOWN");
@@ -255,7 +259,9 @@ impl RxThread {
                     from,
                     session: teardown.session,
                 };
-                let _ = self.control_events.push(event);
+                if self.control_events.push(event).is_err() {
+                    warn!(from = %from, "control event queue full, dropping TEARDOWN");
+                }
             }
         }
     }
@@ -284,17 +290,21 @@ impl RxThread {
             }
             DataPlaneMessage::Ack { channel, seq, .. } => {
                 // Forward to TX thread
-                let _ = self.tx_events.push(RxToTxEvent::Ack {
+                if self.tx_events.push(RxToTxEvent::Ack {
                     channel,
                     seq: seq.into(),
-                });
+                }).is_err() {
+                    warn!(channel = %channel, "TX event queue full, dropping ACK");
+                }
             }
             DataPlaneMessage::Nack { channel, seq } => {
                 // Forward to TX thread
-                let _ = self.tx_events.push(RxToTxEvent::Nack {
+                if self.tx_events.push(RxToTxEvent::Nack {
                     channel,
                     seq: seq.into(),
-                });
+                }).is_err() {
+                    warn!(channel = %channel, "TX event queue full, dropping NACK");
+                }
             }
             DataPlaneMessage::Heartbeat {
                 channel,
@@ -302,10 +312,12 @@ impl RxThread {
                 ..
             } => {
                 // Forward to TX thread
-                let _ = self.tx_events.push(RxToTxEvent::Heartbeat {
+                if self.tx_events.push(RxToTxEvent::Heartbeat {
                     channel,
                     next_expected: next_expected.into(),
-                });
+                }).is_err() {
+                    warn!(channel = %channel, "TX event queue full, dropping Heartbeat");
+                }
             }
         }
     }

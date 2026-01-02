@@ -43,8 +43,8 @@ use titan::control::types::{ChannelId, TypeId, driver_inbox_path};
 use titan::ipc::spsc::Timeout;
 use titan::net::Endpoint;
 use titan::runtime::driver::protocol::{
-    NakReason, ProtocolFrame, SessionId, SetupAckFrame, SetupFrame, SetupNakFrame, decode_frame,
-    encode_frame, frame_type,
+    FrameKind, Mtu, NakReason, ProtocolFrame, ReceiverWindow, SessionId, SetupAckFrame, SetupFrame,
+    SetupNakFrame, decode_frame, encode_frame, frame_type,
 };
 use titan::runtime::driver::{Driver, DriverConfig};
 
@@ -78,7 +78,7 @@ fn recv_frame_timeout(socket: &UdpSocket, timeout: Duration) -> Option<(Protocol
     loop {
         match socket.recv_from(&mut buf) {
             Ok((len, from)) => {
-                if len > 0 && frame_type::is_protocol_frame(buf[0]) {
+                if len > 0 && matches!(frame_type::classify(buf[0]), FrameKind::Protocol(_)) {
                     if let Ok(frame) = decode_frame(&buf[..len]) {
                         return Some((frame, Endpoint::from(from)));
                     }
@@ -105,8 +105,8 @@ fn protocol_frame_roundtrip_over_udp() {
         session: SessionId::generate(),
         channel: ChannelId::from(42),
         type_id: TypeId::of::<HelloMessage>(),
-        receiver_window: 128 * 1024,
-        mtu: 1500,
+        receiver_window: ReceiverWindow::new(128 * 1024),
+        mtu: Mtu::new(1500),
     });
     send_frame(&client, server_addr, &setup);
 
@@ -117,14 +117,14 @@ fn protocol_frame_roundtrip_over_udp() {
     match received {
         ProtocolFrame::Setup(s) => {
             assert_eq!(u32::from(s.channel), 42);
-            assert_eq!(s.receiver_window, 128 * 1024);
-            assert_eq!(s.mtu, 1500);
+            assert_eq!(s.receiver_window.as_u32(), 128 * 1024);
+            assert_eq!(s.mtu.as_u16(), 1500);
 
             // Server sends SETUP_ACK
             let ack = ProtocolFrame::SetupAck(SetupAckFrame {
                 session: s.session,
                 publisher_session: SessionId::generate(),
-                mtu: 1400,
+                mtu: Mtu::new(1400),
             });
             send_frame(&server, from, &ack);
         }
@@ -137,7 +137,7 @@ fn protocol_frame_roundtrip_over_udp() {
 
     match received {
         ProtocolFrame::SetupAck(ack) => {
-            assert_eq!(ack.mtu, 1400);
+            assert_eq!(ack.mtu.as_u16(), 1400);
         }
         _ => panic!("expected SETUP_ACK frame"),
     }
@@ -153,8 +153,8 @@ fn setup_nak_type_mismatch() {
         session: SessionId::generate(),
         channel: ChannelId::from(1),
         type_id: TypeId::of::<u32>(), // Wrong type
-        receiver_window: 64 * 1024,
-        mtu: 1500,
+        receiver_window: ReceiverWindow::new(64 * 1024),
+        mtu: Mtu::new(1500),
     });
     send_frame(&client, server_addr, &setup);
 
@@ -195,8 +195,8 @@ fn setup_nak_channel_not_found() {
         session,
         channel: ChannelId::from(999), // Non-existent
         type_id: TypeId::of::<HelloMessage>(),
-        receiver_window: 64 * 1024,
-        mtu: 1500,
+        receiver_window: ReceiverWindow::new(64 * 1024),
+        mtu: Mtu::new(1500),
     });
     send_frame(&client, server_addr, &setup);
 
@@ -335,8 +335,8 @@ fn real_driver_setup_handshake() {
         session,
         channel: channel_id,
         type_id: TypeId::of::<HelloMessage>(),
-        receiver_window: 64 * 1024,
-        mtu: 1500,
+        receiver_window: ReceiverWindow::new(64 * 1024),
+        mtu: Mtu::new(1500),
     });
     send_frame(&sub_socket, driver_addr, &setup);
 
@@ -346,7 +346,7 @@ fn real_driver_setup_handshake() {
     match response {
         Some((ProtocolFrame::SetupAck(ack), _)) => {
             assert_eq!(ack.session, session, "session ID should be echoed");
-            assert!(ack.mtu <= 1500, "negotiated MTU should be <= requested");
+            assert!(ack.mtu.as_u16() <= 1500, "negotiated MTU should be <= requested");
         }
         Some((other, _)) => panic!("expected SETUP_ACK, got {:?}", other),
         None => panic!("no response received from driver"),
@@ -393,8 +393,8 @@ fn real_driver_naks_type_mismatch() {
         session,
         channel: channel_id,
         type_id: TypeId::of::<u32>(), // Wrong type!
-        receiver_window: 64 * 1024,
-        mtu: 1500,
+        receiver_window: ReceiverWindow::new(64 * 1024),
+        mtu: Mtu::new(1500),
     });
     send_frame(&sub_socket, driver_addr, &setup);
 
@@ -445,8 +445,8 @@ fn real_driver_naks_channel_not_found() {
         session,
         channel: ChannelId::from(999), // Channel doesn't exist
         type_id: TypeId::of::<HelloMessage>(),
-        receiver_window: 64 * 1024,
-        mtu: 1500,
+        receiver_window: ReceiverWindow::new(64 * 1024),
+        mtu: Mtu::new(1500),
     });
     send_frame(&sub_socket, driver_addr, &setup);
 
@@ -550,8 +550,8 @@ fn full_e2e_publisher_to_subscriber() {
         session,
         channel: publisher_channel,
         type_id: TypeId::of::<HelloMessage>(),
-        receiver_window: 128 * 1024,
-        mtu: 1500,
+        receiver_window: ReceiverWindow::new(128 * 1024),
+        mtu: Mtu::new(1500),
     });
     send_frame(&d2_socket, d1_addr, &setup);
 
@@ -595,7 +595,7 @@ fn full_e2e_publisher_to_subscriber() {
                     continue;
                 }
                 // Skip protocol frames
-                if frame_type::is_protocol_frame(buf[0]) {
+                if matches!(frame_type::classify(buf[0]), FrameKind::Protocol(_)) {
                     continue;
                 }
                 // Try to decode as data plane message

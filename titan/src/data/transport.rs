@@ -173,7 +173,7 @@ pub fn encode_message<const N: usize>(
         } => {
             w.put_u32(TAG_DATA);
             w.put_u32(u32::from(*channel));
-            w.put_u64(seq.0);
+            w.put_u64(seq.as_u64());
             w.put_u64(send_timestamp.units());
             let len = u16::try_from(frame.len()).map_err(|_| TransportError::InvalidLength)?;
             w.put_u16(len);
@@ -186,13 +186,13 @@ pub fn encode_message<const N: usize>(
         } => {
             w.put_u32(TAG_ACK);
             w.put_u32(u32::from(*channel));
-            w.put_u64(seq.0);
+            w.put_u64(seq.as_u64());
             w.put_u64(echo_timestamp.units());
         }
         DataPlaneMessage::Nack { channel, seq } => {
             w.put_u32(TAG_NACK);
             w.put_u32(u32::from(*channel));
-            w.put_u64(seq.0);
+            w.put_u64(seq.as_u64());
         }
         DataPlaneMessage::Heartbeat {
             channel,
@@ -201,7 +201,7 @@ pub fn encode_message<const N: usize>(
         } => {
             w.put_u32(TAG_HEARTBEAT);
             w.put_u32(u32::from(*channel));
-            w.put_u64(next_expected.0);
+            w.put_u64(next_expected.as_u64());
             w.put_u64(echo_timestamp.units());
         }
     }
@@ -223,7 +223,7 @@ pub fn decode_message<const N: usize>(bytes: &[u8]) -> Result<DataPlaneMessage<N
     match tag {
         TAG_DATA => {
             let channel = DataChannelId::from(r.take_u32()?);
-            let seq = SeqNum(r.take_u64()?);
+            let seq = SeqNum::from(r.take_u64()?);
             let send_timestamp = MonoTimestamp::new(r.take_u64()?);
             let len = r.take_u16()? as usize;
             let payload = r.take_bytes(len)?;
@@ -237,7 +237,7 @@ pub fn decode_message<const N: usize>(bytes: &[u8]) -> Result<DataPlaneMessage<N
         }
         TAG_ACK => {
             let channel = DataChannelId::from(r.take_u32()?);
-            let seq = SeqNum(r.take_u64()?);
+            let seq = SeqNum::from(r.take_u64()?);
             let echo_timestamp = MonoTimestamp::new(r.take_u64()?);
             Ok(DataPlaneMessage::Ack {
                 channel,
@@ -247,12 +247,12 @@ pub fn decode_message<const N: usize>(bytes: &[u8]) -> Result<DataPlaneMessage<N
         }
         TAG_NACK => {
             let channel = DataChannelId::from(r.take_u32()?);
-            let seq = SeqNum(r.take_u64()?);
+            let seq = SeqNum::from(r.take_u64()?);
             Ok(DataPlaneMessage::Nack { channel, seq })
         }
         TAG_HEARTBEAT => {
             let channel = DataChannelId::from(r.take_u32()?);
-            let next_expected = SeqNum(r.take_u64()?);
+            let next_expected = SeqNum::from(r.take_u64()?);
             let echo_timestamp = MonoTimestamp::new(r.take_u64()?);
             Ok(DataPlaneMessage::Heartbeat {
                 channel,
@@ -276,7 +276,7 @@ mod tests {
     fn roundtrip_data() {
         let msg = DataPlaneMessage::Data {
             channel: DataChannelId::from(42),
-            seq: SeqNum(100),
+            seq: SeqNum::from(100),
             send_timestamp: MonoTimestamp::new(123456),
             frame: make_frame(&[1, 2, 3, 4]),
         };
@@ -292,7 +292,7 @@ mod tests {
                 frame,
             } => {
                 assert_eq!(u32::from(channel), 42);
-                assert_eq!(seq.0, 100);
+                assert_eq!(seq.as_u64(), 100);
                 // assert_eq!(send_timestamp.units(), 123456);
                 assert_eq!(frame.payload(), &[1, 2, 3, 4]);
             }
@@ -304,7 +304,7 @@ mod tests {
     fn roundtrip_ack() {
         let msg: DataPlaneMessage<64> = DataPlaneMessage::Ack {
             channel: DataChannelId::from(7),
-            seq: SeqNum(999),
+            seq: SeqNum::from(999),
             echo_timestamp: MonoTimestamp::new(555),
         };
         let mut buf = Vec::new();
@@ -318,7 +318,7 @@ mod tests {
                 echo_timestamp,
             } => {
                 assert_eq!(u32::from(channel), 7);
-                assert_eq!(seq.0, 999);
+                assert_eq!(seq.as_u64(), 999);
                 // assert_eq!(echo_timestamp.units(), 555);
             }
             _ => panic!("expected Ack"),
@@ -329,7 +329,7 @@ mod tests {
     fn roundtrip_nack() {
         let msg: DataPlaneMessage<64> = DataPlaneMessage::Nack {
             channel: DataChannelId::from(3),
-            seq: SeqNum(50),
+            seq: SeqNum::from(50),
         };
         let mut buf = Vec::new();
         encode_message(&msg, &mut buf).unwrap();
@@ -338,7 +338,7 @@ mod tests {
         match decoded {
             DataPlaneMessage::Nack { channel, seq } => {
                 assert_eq!(u32::from(channel), 3);
-                assert_eq!(seq.0, 50);
+                assert_eq!(seq.as_u64(), 50);
             }
             _ => panic!("expected Nack"),
         }
@@ -348,7 +348,7 @@ mod tests {
     fn roundtrip_heartbeat() {
         let msg: DataPlaneMessage<64> = DataPlaneMessage::Heartbeat {
             channel: DataChannelId::from(1),
-            next_expected: SeqNum(200),
+            next_expected: SeqNum::from(200),
             echo_timestamp: MonoTimestamp::new(999999),
         };
         let mut buf = Vec::new();
@@ -362,7 +362,7 @@ mod tests {
                 echo_timestamp,
             } => {
                 assert_eq!(u32::from(channel), 1);
-                assert_eq!(next_expected.0, 200);
+                assert_eq!(next_expected.as_u64(), 200);
                 // assert_eq!(echo_timestamp.units(), 999999);
             }
             _ => panic!("expected Heartbeat"),
@@ -397,7 +397,7 @@ mod tests {
         // Encode a valid Data message, then corrupt the length field
         let msg = DataPlaneMessage::Data {
             channel: DataChannelId::from(1),
-            seq: SeqNum(1),
+            seq: SeqNum::from(1),
             send_timestamp: MonoTimestamp::new(1),
             frame: make_frame(&[1, 2]),
         };
@@ -419,7 +419,7 @@ mod tests {
         let mut buf = Vec::with_capacity(1024);
         let msg: DataPlaneMessage<64> = DataPlaneMessage::Nack {
             channel: DataChannelId::from(1),
-            seq: SeqNum(1),
+            seq: SeqNum::from(1),
         };
 
         encode_message(&msg, &mut buf).unwrap();
