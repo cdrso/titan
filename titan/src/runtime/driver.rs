@@ -127,7 +127,11 @@
 mod commands;
 pub mod control_thread;
 pub mod protocol;
+mod reassembly;
+mod reorder;
+mod retransmit;
 pub mod rx_thread;
+mod timing;
 pub mod tx_thread;
 
 use std::sync::Arc;
@@ -138,11 +142,13 @@ use std::time::Duration;
 use crate::control::types::ConnectionError;
 use crate::ipc::shmem::ShmPath;
 use crate::net::{Endpoint, UdpSocket};
+use crate::runtime::topology::{CpuConfig, pin_to_core};
 use crate::sync::spsc;
-use crate::trace::{debug, error, info};
+use crate::trace::{debug, error, info, warn};
 
 use commands::{COMMAND_QUEUE_CAPACITY, RxCommand, RxToControlEvent, RxToTxEvent, TxCommand};
 use control_thread::ControlThread;
+use protocol::init_session_counter;
 use rx_thread::RxThread;
 use tx_thread::TxThread;
 
@@ -157,6 +163,9 @@ pub struct DriverConfig {
     /// Path for the driver's inbox (for client connections).
     /// If `None`, uses the default path `/titan-driver-inbox`.
     pub inbox_path: Option<ShmPath>,
+    /// CPU pinning configuration.
+    /// If `Auto`, detects topology and pins threads optimally.
+    pub cpu_config: CpuConfig,
 }
 
 impl Default for DriverConfig {
@@ -166,6 +175,7 @@ impl Default for DriverConfig {
             endpoints: Vec::new(),
             session_timeout: Duration::from_secs(30),
             inbox_path: None,
+            cpu_config: CpuConfig::Auto,
         }
     }
 }
@@ -204,6 +214,19 @@ impl Driver {
     /// # Panics
     /// Panics if thread spawning fails.
     pub fn spawn(config: DriverConfig) -> Result<Self, DriverError> {
+        // Initialize session counter with current timestamp for uniqueness across restarts
+        init_session_counter();
+
+        // Resolve CPU placement
+        let placement = config.cpu_config.resolve();
+        info!(
+            strategy = %placement.strategy,
+            rx_core = ?placement.rx_core,
+            tx_core = ?placement.tx_core,
+            control_core = ?placement.control_core,
+            "CPU placement resolved"
+        );
+
         info!(
             bind_addr = %config.bind_addr,
             endpoints = ?config.endpoints,
@@ -214,10 +237,22 @@ impl Driver {
 
         // Create a single UDP socket for both TX and RX
         // UDP sockets are thread-safe for concurrent send/recv
-        let socket = Arc::new(UdpSocket::bind(config.bind_addr).map_err(|e| {
+        let socket = UdpSocket::bind(config.bind_addr).map_err(|e| {
             error!(bind_addr = %config.bind_addr, error = %e, "failed to bind UDP socket");
             DriverError::Bind(e)
-        })?);
+        })?;
+
+        // Set large socket buffers to prevent packet loss under high load
+        // 8MB buffers to handle burst traffic
+        const SOCKET_BUF_SIZE: usize = 8 * 1024 * 1024;
+        if let Err(e) = socket.set_send_buffer_size(SOCKET_BUF_SIZE) {
+            warn!(error = %e, "failed to set send buffer size");
+        }
+        if let Err(e) = socket.set_recv_buffer_size(SOCKET_BUF_SIZE) {
+            warn!(error = %e, "failed to set recv buffer size");
+        }
+
+        let socket = Arc::new(socket);
         let tx_socket = Arc::clone(&socket);
         let rx_socket = socket;
 
@@ -247,9 +282,18 @@ impl Driver {
 
         // Spawn TX thread
         debug!("spawning TX thread");
+        let tx_core = placement.tx_core;
         let tx_handle = thread::Builder::new()
             .name("titan-tx".into())
             .spawn(move || {
+                // Pin to core if configured
+                if let Some(core_id) = tx_core {
+                    if pin_to_core(core_id) {
+                        info!(core = core_id, "TX thread pinned to core");
+                    } else {
+                        warn!(core = core_id, "TX thread failed to pin to core");
+                    }
+                }
                 info!("TX thread started");
                 let mut tx = TxThread::new(tx_socket, tx_cmd_consumer, rx_tx_consumer);
                 tx.run();
@@ -259,9 +303,18 @@ impl Driver {
 
         // Spawn RX thread
         debug!("spawning RX thread");
+        let rx_core = placement.rx_core;
         let rx_handle = thread::Builder::new()
             .name("titan-rx".into())
             .spawn(move || {
+                // Pin to core if configured
+                if let Some(core_id) = rx_core {
+                    if pin_to_core(core_id) {
+                        info!(core = core_id, "RX thread pinned to core");
+                    } else {
+                        warn!(core = core_id, "RX thread failed to pin to core");
+                    }
+                }
                 info!("RX thread started");
                 let mut rx =
                     RxThread::new(rx_socket, rx_cmd_consumer, rx_tx_producer, rx_ctrl_producer);
@@ -272,9 +325,18 @@ impl Driver {
 
         // Spawn control thread
         debug!("spawning control thread");
+        let control_core = placement.control_core;
         let control_handle = thread::Builder::new()
             .name("titan-control".into())
             .spawn(move || {
+                // Pin to core if configured
+                if let Some(core_id) = control_core {
+                    if pin_to_core(core_id) {
+                        info!(core = core_id, "control thread pinned to core");
+                    } else {
+                        warn!(core = core_id, "control thread failed to pin to core");
+                    }
+                }
                 info!("control thread started");
                 let mut control = control_thread;
                 control.run();

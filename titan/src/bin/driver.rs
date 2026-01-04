@@ -193,6 +193,7 @@ fn parse_args(args: &[String]) -> Result<DriverConfig, DriverError> {
         endpoints,
         session_timeout: Duration::from_secs(timeout_secs),
         inbox_path,
+        cpu_config: titan::runtime::topology::CpuConfig::Auto,
     })
 }
 

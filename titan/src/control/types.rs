@@ -15,7 +15,7 @@ pub const CONTROL_QUEUE_CAPACITY: usize = 1024;
 pub const DRIVER_INBOX_CAPACITY: usize = 256;
 
 /// Capacity of per-client data queues (tx or rx).
-pub const DATA_QUEUE_CAPACITY: usize = 1024;
+pub const DATA_QUEUE_CAPACITY: usize = 65536;
 
 /// Timeout for receiving Hello/Welcome during handshake.
 pub const HELLO_TIMEOUT: Duration = Duration::from_millis(500);

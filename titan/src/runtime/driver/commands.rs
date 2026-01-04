@@ -10,6 +10,7 @@
 //! - RX → TX: Reliability events (ack/nack) for future retransmission
 
 use crate::control::types::{ChannelId, ClientId, TypeId};
+use crate::data::types::SeqNum;
 use crate::data::Frame;
 use crate::ipc::shmem::Opener;
 use crate::ipc::spsc::{Consumer as IpcConsumer, Producer as IpcProducer};
@@ -94,6 +95,8 @@ pub enum TxCommand {
         endpoint: Endpoint,
         /// Subscriber's initial receiver window.
         receiver_window: u32,
+        /// Negotiated MTU (max frame size for this subscriber).
+        mtu: u16,
     },
 
     /// Remove a subscriber from a published channel.
@@ -174,7 +177,7 @@ pub enum RxToTxEvent {
         /// Channel the ack is for.
         channel: ChannelId,
         /// Acknowledged sequence number.
-        seq: u64,
+        seq: SeqNum,
     },
 
     /// Negative acknowledgment / gap detected.
@@ -182,7 +185,9 @@ pub enum RxToTxEvent {
         /// Channel the nack is for.
         channel: ChannelId,
         /// Missing sequence number.
-        seq: u64,
+        seq: SeqNum,
+        /// Endpoint requesting retransmission.
+        from: Endpoint,
     },
 
     /// Heartbeat received from peer.
@@ -190,7 +195,7 @@ pub enum RxToTxEvent {
         /// Channel the heartbeat is for.
         channel: ChannelId,
         /// Peer's next expected sequence number.
-        next_expected: u64,
+        next_expected: SeqNum,
     },
 
     /// Status Message received from a subscriber (flow control update).
@@ -198,7 +203,7 @@ pub enum RxToTxEvent {
         /// Publisher's session ID.
         session: SessionId,
         /// Subscriber's consumption offset.
-        consumption_offset: u64,
+        consumption_offset: SeqNum,
         /// Subscriber's current receiver window.
         receiver_window: u32,
     },
@@ -232,6 +237,8 @@ pub enum RxToControlEvent {
         session: SessionId,
         /// Publisher's session ID (for future SM).
         publisher_session: SessionId,
+        /// First sequence number subscriber should expect.
+        first_seq: u64,
         /// Negotiated MTU.
         mtu: u16,
     },

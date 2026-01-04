@@ -22,6 +22,13 @@ const TAG_DATA: u32 = 0;
 const TAG_ACK: u32 = 1;
 const TAG_NACK: u32 = 2;
 const TAG_HEARTBEAT: u32 = 3;
+const TAG_DATA_FRAG: u32 = 4;
+
+/// Transport header size for DATA frames: tag(4) + channel(4) + seq(8) + timestamp(8) + len(2) = 26 bytes
+pub const DATA_HEADER_SIZE: usize = 4 + 4 + 8 + 8 + 2;
+
+/// Transport header size for DATA_FRAG frames: tag(4) + channel(4) + seq(8) + timestamp(8) + frag_idx(2) + frag_count(2) + len(2) = 30 bytes
+pub const DATA_FRAG_HEADER_SIZE: usize = 4 + 4 + 8 + 8 + 2 + 2 + 2;
 
 /// Writer for encoding messages into a byte buffer.
 struct MessageWriter<'a> {
@@ -129,6 +136,18 @@ pub enum DataPlaneMessage<const N: usize> {
         send_timestamp: MonoTimestamp,
         frame: Frame<N>,
     },
+    /// Fragmented application data.
+    DataFrag {
+        channel: DataChannelId,
+        seq: SeqNum,
+        send_timestamp: MonoTimestamp,
+        /// Fragment index (0-based).
+        frag_index: u16,
+        /// Total number of fragments.
+        frag_count: u16,
+        /// Fragment payload (subset of original message).
+        payload: Frame<N>,
+    },
     /// Acknowledgment for received data (could be cumulative or selective).
     Ack {
         channel: DataChannelId,
@@ -149,6 +168,90 @@ impl From<FrameError> for TransportError {
     fn from(e: FrameError) -> Self {
         Self::Frame(e)
     }
+}
+
+/// Encode a DATA frame directly from references (zero intermediate copies).
+///
+/// This is the hot-path optimized version that avoids copying the frame into
+/// a `DataPlaneMessage` struct. Use this in TX thread's drain loop.
+///
+/// # Arguments
+/// * `channel` - Channel ID
+/// * `seq` - Sequence number
+/// * `send_timestamp` - Send timestamp
+/// * `frame` - Frame reference (not copied)
+/// * `buf` - Pre-allocated output buffer
+///
+/// # Errors
+/// Returns [`TransportError::InvalidLength`] if the frame length exceeds `u16::MAX`.
+pub fn encode_data_frame<const N: usize>(
+    channel: DataChannelId,
+    seq: SeqNum,
+    send_timestamp: MonoTimestamp,
+    frame: &Frame<N>,
+    buf: &mut Vec<u8>,
+) -> Result<(), TransportError> {
+    let mut w = MessageWriter::new(buf);
+    w.put_u32(TAG_DATA);
+    w.put_u32(u32::from(channel));
+    w.put_u64(seq.as_u64());
+    w.put_u64(send_timestamp.units());
+    let len = u16::try_from(frame.len()).map_err(|_| TransportError::InvalidLength)?;
+    w.put_u16(len);
+    w.put_bytes(frame.payload());
+    Ok(())
+}
+
+/// Encode a DATA_FRAG frame directly from references (zero intermediate copies).
+///
+/// This encodes a single fragment of a larger message.
+///
+/// # Arguments
+/// * `channel` - Channel ID
+/// * `seq` - Message sequence number (same for all fragments of one message)
+/// * `send_timestamp` - Send timestamp
+/// * `frag_index` - Fragment index (0-based)
+/// * `frag_count` - Total fragment count
+/// * `payload` - Fragment payload bytes (slice of original payload)
+/// * `buf` - Pre-allocated output buffer
+///
+/// # Errors
+/// Returns [`TransportError::InvalidLength`] if the payload length exceeds `u16::MAX`.
+pub fn encode_data_frag(
+    channel: DataChannelId,
+    seq: SeqNum,
+    send_timestamp: MonoTimestamp,
+    frag_index: u16,
+    frag_count: u16,
+    payload: &[u8],
+    buf: &mut Vec<u8>,
+) -> Result<(), TransportError> {
+    let mut w = MessageWriter::new(buf);
+    w.put_u32(TAG_DATA_FRAG);
+    w.put_u32(u32::from(channel));
+    w.put_u64(seq.as_u64());
+    w.put_u64(send_timestamp.units());
+    w.put_u16(frag_index);
+    w.put_u16(frag_count);
+    let len = u16::try_from(payload.len()).map_err(|_| TransportError::InvalidLength)?;
+    w.put_u16(len);
+    w.put_bytes(payload);
+    Ok(())
+}
+
+/// Decoded fragment data (returned from `decode_message` for DATA_FRAG).
+#[derive(Debug)]
+pub struct FragmentInfo {
+    /// Channel ID.
+    pub channel: DataChannelId,
+    /// Message sequence number (same for all fragments of one message).
+    pub seq: SeqNum,
+    /// Send timestamp.
+    pub send_timestamp: MonoTimestamp,
+    /// Fragment index (0-based).
+    pub frag_index: u16,
+    /// Total fragment count.
+    pub frag_count: u16,
 }
 
 /// Encode a message into `buf`.
@@ -178,6 +281,24 @@ pub fn encode_message<const N: usize>(
             let len = u16::try_from(frame.len()).map_err(|_| TransportError::InvalidLength)?;
             w.put_u16(len);
             w.put_bytes(frame.payload());
+        }
+        DataPlaneMessage::DataFrag {
+            channel,
+            seq,
+            send_timestamp,
+            frag_index,
+            frag_count,
+            payload,
+        } => {
+            w.put_u32(TAG_DATA_FRAG);
+            w.put_u32(u32::from(*channel));
+            w.put_u64(seq.as_u64());
+            w.put_u64(send_timestamp.units());
+            w.put_u16(*frag_index);
+            w.put_u16(*frag_count);
+            let len = u16::try_from(payload.len()).map_err(|_| TransportError::InvalidLength)?;
+            w.put_u16(len);
+            w.put_bytes(payload.payload());
         }
         DataPlaneMessage::Ack {
             channel,
@@ -258,6 +379,24 @@ pub fn decode_message<const N: usize>(bytes: &[u8]) -> Result<DataPlaneMessage<N
                 channel,
                 next_expected,
                 echo_timestamp,
+            })
+        }
+        TAG_DATA_FRAG => {
+            let channel = DataChannelId::from(r.take_u32()?);
+            let seq = SeqNum::from(r.take_u64()?);
+            let send_timestamp = MonoTimestamp::new(r.take_u64()?);
+            let frag_index = r.take_u16()?;
+            let frag_count = r.take_u16()?;
+            let len = r.take_u16()? as usize;
+            let payload_bytes = r.take_bytes(len)?;
+            let payload: Frame<N> = payload_bytes.try_into()?;
+            Ok(DataPlaneMessage::DataFrag {
+                channel,
+                seq,
+                send_timestamp,
+                frag_index,
+                frag_count,
+                payload,
             })
         }
         other => Err(TransportError::InvalidDiscriminant(other)),
@@ -447,5 +586,266 @@ mod tests {
             }
             _ => panic!("expected Data"),
         }
+    }
+
+    // =========================================================================
+    // DATA_FRAG Serialization Tests (CONTRACT_012)
+    // =========================================================================
+
+    #[test]
+    fn roundtrip_data_frag_single_fragment() {
+        let msg: DataPlaneMessage<64> = DataPlaneMessage::DataFrag {
+            channel: DataChannelId::from(42),
+            seq: SeqNum::from(100),
+            send_timestamp: MonoTimestamp::new(999_999),
+            frag_index: 0,
+            frag_count: 1,
+            payload: make_frame(&[1, 2, 3, 4, 5]),
+        };
+
+        let mut buf = Vec::new();
+        encode_message(&msg, &mut buf).unwrap();
+
+        let decoded: DataPlaneMessage<64> = decode_message(&buf).unwrap();
+        match decoded {
+            DataPlaneMessage::DataFrag {
+                channel,
+                seq,
+                frag_index,
+                frag_count,
+                payload,
+                ..
+            } => {
+                assert_eq!(u32::from(channel), 42);
+                assert_eq!(seq.as_u64(), 100);
+                assert_eq!(frag_index, 0);
+                assert_eq!(frag_count, 1);
+                assert_eq!(payload.payload(), &[1, 2, 3, 4, 5]);
+            }
+            _ => panic!("expected DataFrag"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_data_frag_multiple_fragments() {
+        // Simulate 3 fragments of a larger message
+        for (idx, payload_data) in [(0u16, &[1, 2, 3][..]), (1, &[4, 5, 6][..]), (2, &[7, 8][..])] {
+            let msg: DataPlaneMessage<64> = DataPlaneMessage::DataFrag {
+                channel: DataChannelId::from(7),
+                seq: SeqNum::from(50),
+                send_timestamp: MonoTimestamp::new(123_456),
+                frag_index: idx,
+                frag_count: 3,
+                payload: payload_data.try_into().unwrap(),
+            };
+
+            let mut buf = Vec::new();
+            encode_message(&msg, &mut buf).unwrap();
+
+            let decoded: DataPlaneMessage<64> = decode_message(&buf).unwrap();
+            match decoded {
+                DataPlaneMessage::DataFrag {
+                    channel,
+                    seq,
+                    frag_index,
+                    frag_count,
+                    payload,
+                    ..
+                } => {
+                    assert_eq!(u32::from(channel), 7);
+                    assert_eq!(seq.as_u64(), 50);
+                    assert_eq!(frag_index, idx);
+                    assert_eq!(frag_count, 3);
+                    assert_eq!(payload.payload(), payload_data);
+                }
+                _ => panic!("expected DataFrag for fragment {}", idx),
+            }
+        }
+    }
+
+    #[test]
+    fn encode_data_frag_direct() {
+        // Test the direct encoding function (hot-path optimized)
+        let mut buf = Vec::new();
+        encode_data_frag(
+            DataChannelId::from(99),
+            SeqNum::from(200),
+            MonoTimestamp::new(555_555),
+            3, // frag_index
+            5, // frag_count
+            &[10, 20, 30, 40],
+            &mut buf,
+        )
+        .unwrap();
+
+        // Decode and verify
+        let decoded: DataPlaneMessage<64> = decode_message(&buf).unwrap();
+        match decoded {
+            DataPlaneMessage::DataFrag {
+                channel,
+                seq,
+                frag_index,
+                frag_count,
+                payload,
+                ..
+            } => {
+                assert_eq!(u32::from(channel), 99);
+                assert_eq!(seq.as_u64(), 200);
+                assert_eq!(frag_index, 3);
+                assert_eq!(frag_count, 5);
+                assert_eq!(payload.payload(), &[10, 20, 30, 40]);
+            }
+            _ => panic!("expected DataFrag"),
+        }
+    }
+
+    #[test]
+    fn data_frag_header_size_correct() {
+        // Verify the header size constant matches actual encoding
+        let mut buf = Vec::new();
+        encode_data_frag(
+            DataChannelId::from(1),
+            SeqNum::from(1),
+            MonoTimestamp::new(1),
+            0,
+            1,
+            &[], // Empty payload
+            &mut buf,
+        )
+        .unwrap();
+
+        assert_eq!(buf.len(), DATA_FRAG_HEADER_SIZE);
+    }
+
+    #[test]
+    fn data_header_size_correct() {
+        // Verify the header size constant matches actual encoding
+        let mut buf = Vec::new();
+        encode_data_frame(
+            DataChannelId::from(1),
+            SeqNum::from(1),
+            MonoTimestamp::new(1),
+            &Frame::<64>::new(), // Empty frame
+            &mut buf,
+        )
+        .unwrap();
+
+        assert_eq!(buf.len(), DATA_HEADER_SIZE);
+    }
+
+    #[test]
+    fn data_frag_empty_payload() {
+        let msg: DataPlaneMessage<64> = DataPlaneMessage::DataFrag {
+            channel: DataChannelId::from(1),
+            seq: SeqNum::from(1),
+            send_timestamp: MonoTimestamp::new(1),
+            frag_index: 0,
+            frag_count: 1,
+            payload: Frame::new(),
+        };
+
+        let mut buf = Vec::new();
+        encode_message(&msg, &mut buf).unwrap();
+
+        let decoded: DataPlaneMessage<64> = decode_message(&buf).unwrap();
+        match decoded {
+            DataPlaneMessage::DataFrag { payload, .. } => {
+                assert!(payload.is_empty());
+            }
+            _ => panic!("expected DataFrag"),
+        }
+    }
+
+    #[test]
+    fn data_frag_max_fragment_index() {
+        // Test with maximum valid fragment index (frag_count - 1)
+        let msg: DataPlaneMessage<64> = DataPlaneMessage::DataFrag {
+            channel: DataChannelId::from(1),
+            seq: SeqNum::from(1),
+            send_timestamp: MonoTimestamp::new(1),
+            frag_index: 63, // Max index for 64-fragment message
+            frag_count: 64,
+            payload: make_frame(&[0xAB]),
+        };
+
+        let mut buf = Vec::new();
+        encode_message(&msg, &mut buf).unwrap();
+
+        let decoded: DataPlaneMessage<64> = decode_message(&buf).unwrap();
+        match decoded {
+            DataPlaneMessage::DataFrag {
+                frag_index,
+                frag_count,
+                ..
+            } => {
+                assert_eq!(frag_index, 63);
+                assert_eq!(frag_count, 64);
+            }
+            _ => panic!("expected DataFrag"),
+        }
+    }
+
+    #[test]
+    fn data_vs_data_frag_discriminant() {
+        // Verify DATA and DATA_FRAG have different discriminants
+        let data_msg: DataPlaneMessage<64> = DataPlaneMessage::Data {
+            channel: DataChannelId::from(1),
+            seq: SeqNum::from(1),
+            send_timestamp: MonoTimestamp::new(1),
+            frame: make_frame(&[1, 2, 3]),
+        };
+
+        let frag_msg: DataPlaneMessage<64> = DataPlaneMessage::DataFrag {
+            channel: DataChannelId::from(1),
+            seq: SeqNum::from(1),
+            send_timestamp: MonoTimestamp::new(1),
+            frag_index: 0,
+            frag_count: 1,
+            payload: make_frame(&[1, 2, 3]),
+        };
+
+        let mut data_buf = Vec::new();
+        let mut frag_buf = Vec::new();
+        encode_message(&data_msg, &mut data_buf).unwrap();
+        encode_message(&frag_msg, &mut frag_buf).unwrap();
+
+        // First 4 bytes are the discriminant
+        assert_ne!(&data_buf[..4], &frag_buf[..4], "DATA and DATA_FRAG should have different tags");
+
+        // DATA tag is 0, DATA_FRAG tag is 4
+        assert_eq!(&data_buf[..4], &[0, 0, 0, 0]);
+        assert_eq!(&frag_buf[..4], &[4, 0, 0, 0]);
+    }
+
+    #[test]
+    fn decode_truncated_data_frag() {
+        // Valid DATA_FRAG discriminant but truncated header
+        let result: Result<DataPlaneMessage<64>, _> = decode_message(&[4, 0, 0, 0, 1, 2, 3]);
+        assert!(matches!(result, Err(TransportError::BufferTooSmall)));
+    }
+
+    #[test]
+    fn decode_data_frag_invalid_payload_length() {
+        // Encode valid DATA_FRAG, then corrupt length
+        let mut buf = Vec::new();
+        encode_data_frag(
+            DataChannelId::from(1),
+            SeqNum::from(1),
+            MonoTimestamp::new(1),
+            0,
+            1,
+            &[1, 2],
+            &mut buf,
+        )
+        .unwrap();
+
+        // Corrupt length field (last 2 bytes of header before payload)
+        // Header: tag(4) + channel(4) + seq(8) + timestamp(8) + frag_idx(2) + frag_count(2) + len(2)
+        let len_offset = 4 + 4 + 8 + 8 + 2 + 2;
+        buf[len_offset] = 0xFF;
+        buf[len_offset + 1] = 0xFF;
+
+        let result: Result<DataPlaneMessage<64>, _> = decode_message(&buf);
+        assert!(matches!(result, Err(TransportError::InvalidLength)));
     }
 }

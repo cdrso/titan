@@ -33,6 +33,36 @@ impl<const N: usize> Frame<N> {
         }
     }
 
+    /// Creates a frame from bytes without zeroing the payload first.
+    ///
+    /// # Safety
+    ///
+    /// This is safe because we immediately copy `bytes` into the payload,
+    /// and only the first `bytes.len()` bytes are considered valid (tracked by `len`).
+    /// The remaining bytes in `payload` are uninitialized but never read.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bytes.len() > N` or `bytes.len() > u16::MAX`.
+    #[inline]
+    #[must_use]
+    pub fn from_bytes_unchecked(bytes: &[u8]) -> Self {
+        let len = bytes.len();
+        debug_assert!(len <= N, "bytes length {} exceeds capacity {}", len, N);
+        debug_assert!(len <= u16::MAX as usize, "bytes length {} exceeds u16::MAX", len);
+
+        // SAFETY: We immediately initialize the valid portion with copy_from_slice.
+        // The Frame only exposes payload[..len] via payload(), so uninitialized
+        // bytes beyond len are never read.
+        unsafe {
+            let mut frame = std::mem::MaybeUninit::<Self>::uninit();
+            let ptr = frame.as_mut_ptr();
+            (*ptr).len = len as u16;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*ptr).payload.as_mut_ptr(), len);
+            frame.assume_init()
+        }
+    }
+
     /// Returns the length of the valid payload.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -64,18 +94,17 @@ impl<const N: usize> TryFrom<&[u8]> for Frame<N> {
     /// Create a frame from raw bytes (already serialized payload).
     ///
     /// Copies `bytes` into the frame payload and sets the length.
+    /// CONTRACT_031: Uses `from_bytes_unchecked` to avoid zeroing payload.
     ///
     /// # Errors
     /// Returns [`FrameError::LenOutOfBounds`] if `bytes` exceed the frame capacity or `u16::MAX`.
+    #[inline]
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
         let len = bytes.len();
-        if len > N {
+        if len > N || len > u16::MAX as usize {
             return Err(FrameError::LenOutOfBounds { len, cap: N });
         }
-        let mut frame = Self::new();
-        frame.len = u16::try_from(len).map_err(|_| FrameError::LenOutOfBounds { len, cap: N })?;
-        frame.payload[..len].copy_from_slice(bytes);
-        Ok(frame)
+        Ok(Self::from_bytes_unchecked(bytes))
     }
 }
 

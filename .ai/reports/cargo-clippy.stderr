@@ -1,0 +1,4 @@
+    Checking titan v0.1.0 (/home/acn/Dev/titan/titan)
+error: could not compile `titan` (lib) due to 1 previous error; 122 warnings emitted
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `titan` (lib test) due to 1 previous error; 156 warnings emitted

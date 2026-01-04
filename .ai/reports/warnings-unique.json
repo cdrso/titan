@@ -1,0 +1,1052 @@
+[
+  {
+    "code": "unused_imports",
+    "message": "unused import: `warn`",
+    "file": "titan/src/control/client.rs",
+    "line": 11,
+    "col": 33
+  },
+  {
+    "code": "clippy::items_after_statements",
+    "message": "adding items after statements is confusing, since items exist from the start of the scope",
+    "file": "titan/src/control/client.rs",
+    "line": 507,
+    "col": 13
+  },
+  {
+    "code": "clippy::items_after_statements",
+    "message": "adding items after statements is confusing, since items exist from the start of the scope",
+    "file": "titan/src/control/client.rs",
+    "line": 542,
+    "col": 13
+  },
+  {
+    "code": "clippy::items_after_statements",
+    "message": "adding items after statements is confusing, since items exist from the start of the scope",
+    "file": "titan/src/control/client.rs",
+    "line": 619,
+    "col": 13
+  },
+  {
+    "code": "clippy::match_same_arms",
+    "message": "these match arms have identical bodies",
+    "file": "titan/src/control/driver.rs",
+    "line": 204,
+    "col": 25
+  },
+  {
+    "code": "unused_variables",
+    "message": "unused variable: `msg`",
+    "file": "titan/src/control/handshake.rs",
+    "line": 51,
+    "col": 14
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/control/types.rs",
+    "line": 187,
+    "col": 15
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/control/types.rs",
+    "line": 203,
+    "col": 53
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/control/types.rs",
+    "line": 205,
+    "col": 54
+  },
+  {
+    "code": "clippy::cast_possible_truncation",
+    "message": "casting `u32` to `u8` may truncate the value",
+    "file": "titan/src/data/channel.rs",
+    "line": 233,
+    "col": 24
+  },
+  {
+    "code": "clippy::len_zero",
+    "message": "length comparison to zero",
+    "file": "titan/src/data/frame.rs",
+    "line": 207,
+    "col": 17
+  },
+  {
+    "code": "clippy::match_same_arms",
+    "message": "these match arms have identical bodies",
+    "file": "titan/src/data/frame.rs",
+    "line": 221,
+    "col": 13
+  },
+  {
+    "code": "clippy::len_zero",
+    "message": "length comparison to zero",
+    "file": "titan/src/data/frame.rs",
+    "line": 276,
+    "col": 17
+  },
+  {
+    "code": "clippy::unreadable_literal",
+    "message": "long literal lacking separators",
+    "file": "titan/src/data/transport.rs",
+    "line": 280,
+    "col": 48
+  },
+  {
+    "code": "unused_variables",
+    "message": "unused variable: `send_timestamp`",
+    "file": "titan/src/data/transport.rs",
+    "line": 291,
+    "col": 17
+  },
+  {
+    "code": "unused_variables",
+    "message": "unused variable: `echo_timestamp`",
+    "file": "titan/src/data/transport.rs",
+    "line": 318,
+    "col": 17
+  },
+  {
+    "code": "clippy::unreadable_literal",
+    "message": "long literal lacking separators",
+    "file": "titan/src/data/transport.rs",
+    "line": 352,
+    "col": 48
+  },
+  {
+    "code": "unused_variables",
+    "message": "unused variable: `echo_timestamp`",
+    "file": "titan/src/data/transport.rs",
+    "line": 362,
+    "col": 17
+  },
+  {
+    "code": "clippy::must_use_candidate",
+    "message": "this method could have a `#[must_use]` attribute",
+    "file": "titan/src/data/types.rs",
+    "line": 41,
+    "col": 18
+  },
+  {
+    "code": "clippy::manual_is_power_of_two",
+    "message": "manually reimplementing `is_power_of_two`",
+    "file": "titan/src/ipc/mpsc.rs",
+    "line": 208,
+    "col": 18
+  },
+  {
+    "code": "clippy::manual_let_else",
+    "message": "this could be rewritten as `let...else`",
+    "file": "titan/src/ipc/mpsc.rs",
+    "line": 248,
+    "col": 9
+  },
+  {
+    "code": "clippy::manual_let_else",
+    "message": "this could be rewritten as `let...else`",
+    "file": "titan/src/ipc/mpsc.rs",
+    "line": 348,
+    "col": 9
+  },
+  {
+    "code": "clippy::stable_sort_primitive",
+    "message": "used `sort` on primitive type `u64`",
+    "file": "titan/src/ipc/mpsc.rs",
+    "line": 438,
+    "col": 9
+  },
+  {
+    "code": "clippy::redundant_clone",
+    "message": "redundant clone",
+    "file": "titan/src/ipc/shmem.rs",
+    "line": 701,
+    "col": 71
+  },
+  {
+    "code": "clippy::manual_let_else",
+    "message": "this could be rewritten as `let...else`",
+    "file": "titan/src/ipc/spsc.rs",
+    "line": 255,
+    "col": 9
+  },
+  {
+    "code": "clippy::manual_let_else",
+    "message": "this could be rewritten as `let...else`",
+    "file": "titan/src/ipc/spsc.rs",
+    "line": 346,
+    "col": 9
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) module inside private module",
+    "file": "titan/src/mpsc.rs",
+    "line": 9,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) struct inside private module",
+    "file": "titan/src/mpsc/ring.rs",
+    "line": 29,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) struct inside private module",
+    "file": "titan/src/mpsc/ring.rs",
+    "line": 59,
+    "col": 1
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/mpsc/ring.rs",
+    "line": 61,
+    "col": 58
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) struct inside private module",
+    "file": "titan/src/mpsc/ring.rs",
+    "line": 82,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) struct inside private module",
+    "file": "titan/src/mpsc/ring.rs",
+    "line": 106,
+    "col": 1
+  },
+  {
+    "code": "clippy::manual_is_power_of_two",
+    "message": "manually reimplementing `is_power_of_two`",
+    "file": "titan/src/mpsc/ring.rs",
+    "line": 124,
+    "col": 18
+  },
+  {
+    "code": "clippy::cast_possible_wrap",
+    "message": "casting `usize` to `isize` may wrap around the value",
+    "file": "titan/src/mpsc/ring.rs",
+    "line": 155,
+    "col": 24
+  },
+  {
+    "code": "clippy::needless_continue",
+    "message": "this `continue` expression is redundant",
+    "file": "titan/src/mpsc/ring.rs",
+    "line": 180,
+    "col": 25
+  },
+  {
+    "code": "clippy::while_let_loop",
+    "message": "this loop could be written as a `while let` loop",
+    "file": "titan/src/mpsc/ring.rs",
+    "line": 338,
+    "col": 9
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/net.rs",
+    "line": 5,
+    "col": 49
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/net/endpoint.rs",
+    "line": 4,
+    "col": 42
+  },
+  {
+    "code": "clippy::missing_errors_doc",
+    "message": "docs for function returning `Result` missing `# Errors` section",
+    "file": "titan/src/net/socket.rs",
+    "line": 75,
+    "col": 5
+  },
+  {
+    "code": "clippy::missing_errors_doc",
+    "message": "docs for function returning `Result` missing `# Errors` section",
+    "file": "titan/src/net/socket.rs",
+    "line": 86,
+    "col": 5
+  },
+  {
+    "code": "clippy::similar_names",
+    "message": "binding's name is too similar to existing binding",
+    "file": "titan/src/net/socket.rs",
+    "line": 195,
+    "col": 14
+  },
+  {
+    "code": "clippy::doc_lazy_continuation",
+    "message": "doc list item without indentation",
+    "file": "titan/src/runtime/client.rs",
+    "line": 7,
+    "col": 5
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver.rs",
+    "line": 24,
+    "col": 9
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver.rs",
+    "line": 26,
+    "col": 9
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver.rs",
+    "line": 28,
+    "col": 9
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver.rs",
+    "line": 60,
+    "col": 7
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver.rs",
+    "line": 61,
+    "col": 7
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver.rs",
+    "line": 102,
+    "col": 12
+  },
+  {
+    "code": "clippy::missing_panics_doc",
+    "message": "docs for function which may panic missing `# Panics` section",
+    "file": "titan/src/runtime/driver.rs",
+    "line": 204,
+    "col": 5
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/commands.rs",
+    "line": 109,
+    "col": 18
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/commands.rs",
+    "line": 227,
+    "col": 18
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/commands.rs",
+    "line": 239,
+    "col": 18
+  },
+  {
+    "code": "clippy::used_underscore_items",
+    "message": "used underscore-prefixed item",
+    "file": "titan/src/runtime/driver/commands.rs",
+    "line": 267,
+    "col": 9
+  },
+  {
+    "code": "clippy::used_underscore_items",
+    "message": "used underscore-prefixed item",
+    "file": "titan/src/runtime/driver/commands.rs",
+    "line": 268,
+    "col": 9
+  },
+  {
+    "code": "clippy::used_underscore_items",
+    "message": "used underscore-prefixed item",
+    "file": "titan/src/runtime/driver/commands.rs",
+    "line": 269,
+    "col": 9
+  },
+  {
+    "code": "clippy::used_underscore_items",
+    "message": "used underscore-prefixed item",
+    "file": "titan/src/runtime/driver/commands.rs",
+    "line": 270,
+    "col": 9
+  },
+  {
+    "code": "unused_imports",
+    "message": "unused import: `trace`",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 17,
+    "col": 33
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 80,
+    "col": 60
+  },
+  {
+    "code": "dead_code",
+    "message": "fields `local_channel` and `client` are never read",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 95,
+    "col": 5
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 115,
+    "col": 29
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 118,
+    "col": 41
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 121,
+    "col": 48
+  },
+  {
+    "code": "clippy::manual_let_else",
+    "message": "this could be rewritten as `let...else`",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 266,
+    "col": 9
+  },
+  {
+    "code": "clippy::single_match_else",
+    "message": "you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 266,
+    "col": 27
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 319,
+    "col": 17
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 344,
+    "col": 17
+  },
+  {
+    "code": "clippy::needless_pass_by_ref_mut",
+    "message": "this argument is a mutable reference, but not used mutably",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 360,
+    "col": 24
+  },
+  {
+    "code": "clippy::explicit_iter_loop",
+    "message": "it is more concise to loop over references to containers instead of using explicit iteration methods",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 362,
+    "col": 29
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 373,
+    "col": 17
+  },
+  {
+    "code": "clippy::manual_let_else",
+    "message": "this could be rewritten as `let...else`",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 388,
+    "col": 9
+  },
+  {
+    "code": "clippy::collapsible_if",
+    "message": "this `if` statement can be collapsed",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 443,
+    "col": 9
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 455,
+    "col": 17
+  },
+  {
+    "code": "clippy::manual_let_else",
+    "message": "this could be rewritten as `let...else`",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 460,
+    "col": 9
+  },
+  {
+    "code": "clippy::collapsible_if",
+    "message": "this `if` statement can be collapsed",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 485,
+    "col": 9
+  },
+  {
+    "code": "clippy::needless_pass_by_ref_mut",
+    "message": "this argument is a mutable reference, but not used mutably",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 556,
+    "col": 20
+  },
+  {
+    "code": "unused_variables",
+    "message": "unused variable: `e`",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 582,
+    "col": 21
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 690,
+    "col": 17
+  },
+  {
+    "code": "unused_variables",
+    "message": "unused variable: `e`",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 718,
+    "col": 17
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 765,
+    "col": 17
+  },
+  {
+    "code": "unused_variables",
+    "message": "unused variable: `e`",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 784,
+    "col": 17
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/control_thread.rs",
+    "line": 815,
+    "col": 17
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 20,
+    "col": 14
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 21,
+    "col": 14
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 34,
+    "col": 7
+  },
+  {
+    "code": "clippy::must_use_candidate",
+    "message": "this method could have a `#[must_use]` attribute",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 62,
+    "col": 18
+  },
+  {
+    "code": "clippy::must_use_candidate",
+    "message": "this method could have a `#[must_use]` attribute",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 72,
+    "col": 18
+  },
+  {
+    "code": "clippy::must_use_candidate",
+    "message": "this function could have a `#[must_use]` attribute",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 95,
+    "col": 18
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 112,
+    "col": 32
+  },
+  {
+    "code": "clippy::must_use_candidate",
+    "message": "this method could have a `#[must_use]` attribute",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 126,
+    "col": 18
+  },
+  {
+    "code": "clippy::must_use_candidate",
+    "message": "this method could have a `#[must_use]` attribute",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 160,
+    "col": 18
+  },
+  {
+    "code": "clippy::manual_range_contains",
+    "message": "manual `RangeInclusive::contains` implementation",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 188,
+    "col": 13
+  },
+  {
+    "code": "clippy::must_use_candidate",
+    "message": "this method could have a `#[must_use]` attribute",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 196,
+    "col": 18
+  },
+  {
+    "code": "clippy::must_use_candidate",
+    "message": "this method could have a `#[must_use]` attribute",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 216,
+    "col": 18
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 281,
+    "col": 5
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 302,
+    "col": 5
+  },
+  {
+    "code": "clippy::cast_possible_truncation",
+    "message": "casting `usize` to `u16` may truncate the value",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 422,
+    "col": 25
+  },
+  {
+    "code": "clippy::missing_const_for_fn",
+    "message": "this could be a `const fn`",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 439,
+    "col": 5
+  },
+  {
+    "code": "clippy::missing_errors_doc",
+    "message": "docs for function returning `Result` missing `# Errors` section",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 498,
+    "col": 1
+  },
+  {
+    "code": "clippy::missing_errors_doc",
+    "message": "docs for function returning `Result` missing `# Errors` section",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 537,
+    "col": 1
+  },
+  {
+    "code": "clippy::unreadable_literal",
+    "message": "long literal lacking separators",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 594,
+    "col": 38
+  },
+  {
+    "code": "clippy::unreadable_literal",
+    "message": "long literal lacking separators",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 596,
+    "col": 35
+  },
+  {
+    "code": "clippy::unreadable_literal",
+    "message": "long literal lacking separators",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 611,
+    "col": 38
+  },
+  {
+    "code": "clippy::unreadable_literal",
+    "message": "long literal lacking separators",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 612,
+    "col": 48
+  },
+  {
+    "code": "clippy::unreadable_literal",
+    "message": "long literal lacking separators",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 626,
+    "col": 38
+  },
+  {
+    "code": "clippy::unreadable_literal",
+    "message": "long literal lacking separators",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 640,
+    "col": 38
+  },
+  {
+    "code": "clippy::unreadable_literal",
+    "message": "long literal lacking separators",
+    "file": "titan/src/runtime/driver/protocol.rs",
+    "line": 655,
+    "col": 38
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/rx_thread.rs",
+    "line": 50,
+    "col": 15
+  },
+  {
+    "code": "unused_variables",
+    "message": "unused variable: `client`",
+    "file": "titan/src/runtime/driver/rx_thread.rs",
+    "line": 109,
+    "col": 21
+  },
+  {
+    "code": "clippy::match_same_arms",
+    "message": "these match arms have identical bodies",
+    "file": "titan/src/runtime/driver/rx_thread.rs",
+    "line": 158,
+    "col": 13
+  },
+  {
+    "code": "clippy::useless_conversion",
+    "message": "useless conversion to the same type: `net::endpoint::Endpoint`",
+    "file": "titan/src/runtime/driver/rx_thread.rs",
+    "line": 166,
+    "col": 29
+  },
+  {
+    "code": "clippy::needless_pass_by_ref_mut",
+    "message": "this argument is a mutable reference, but not used mutably",
+    "file": "titan/src/runtime/driver/rx_thread.rs",
+    "line": 176,
+    "col": 30
+  },
+  {
+    "code": "unused_variables",
+    "message": "unused variable: `e`",
+    "file": "titan/src/runtime/driver/rx_thread.rs",
+    "line": 179,
+    "col": 17
+  },
+  {
+    "code": "clippy::needless_pass_by_value",
+    "message": "this argument is passed by value, but not consumed in the function body",
+    "file": "titan/src/runtime/driver/rx_thread.rs",
+    "line": 281,
+    "col": 39
+  },
+  {
+    "code": "clippy::large_types_passed_by_value",
+    "message": "this argument (320 byte) is passed by value, but might be more efficient if passed by reference (limit: 256 byte)",
+    "file": "titan/src/runtime/driver/rx_thread.rs",
+    "line": 330,
+    "col": 16
+  },
+  {
+    "code": "clippy::manual_let_else",
+    "message": "this could be rewritten as `let...else`",
+    "file": "titan/src/runtime/driver/rx_thread.rs",
+    "line": 351,
+    "col": 9
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/tx_thread.rs",
+    "line": 8,
+    "col": 29
+  },
+  {
+    "code": "clippy::must_use_candidate",
+    "message": "this method could have a `#[must_use]` attribute",
+    "file": "titan/src/runtime/driver/tx_thread.rs",
+    "line": 90,
+    "col": 18
+  },
+  {
+    "code": "clippy::must_use_candidate",
+    "message": "this method could have a `#[must_use]` attribute",
+    "file": "titan/src/runtime/driver/tx_thread.rs",
+    "line": 94,
+    "col": 18
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/tx_thread.rs",
+    "line": 116,
+    "col": 36
+  },
+  {
+    "code": "clippy::needless_pass_by_value",
+    "message": "this argument is passed by value, but not consumed in the function body",
+    "file": "titan/src/runtime/driver/tx_thread.rs",
+    "line": 151,
+    "col": 17
+  },
+  {
+    "code": "unused_variables",
+    "message": "unused variable: `client`",
+    "file": "titan/src/runtime/driver/tx_thread.rs",
+    "line": 198,
+    "col": 21
+  },
+  {
+    "code": "clippy::if_not_else",
+    "message": "unnecessary boolean `not` operation",
+    "file": "titan/src/runtime/driver/tx_thread.rs",
+    "line": 226,
+    "col": 21
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/runtime/driver/tx_thread.rs",
+    "line": 360,
+    "col": 67
+  },
+  {
+    "code": "clippy::manual_let_else",
+    "message": "this could be rewritten as `let...else`",
+    "file": "titan/src/runtime/driver/tx_thread.rs",
+    "line": 369,
+    "col": 13
+  },
+  {
+    "code": "clippy::manual_let_else",
+    "message": "this could be rewritten as `let...else`",
+    "file": "titan/src/runtime/driver/tx_thread.rs",
+    "line": 375,
+    "col": 13
+  },
+  {
+    "code": "clippy::missing_errors_doc",
+    "message": "docs for function returning `Result` missing `# Errors` section",
+    "file": "titan/src/runtime/timing/scoped.rs",
+    "line": 34,
+    "col": 5
+  },
+  {
+    "code": "clippy::missing_errors_doc",
+    "message": "docs for function returning `Result` missing `# Errors` section",
+    "file": "titan/src/runtime/timing/scoped.rs",
+    "line": 43,
+    "col": 5
+  },
+  {
+    "code": "clippy::missing_const_for_fn",
+    "message": "this could be a `const fn`",
+    "file": "titan/src/runtime/timing/tick.rs",
+    "line": 37,
+    "col": 5
+  },
+  {
+    "code": "clippy::unused_self",
+    "message": "unused `self` argument",
+    "file": "titan/src/runtime/timing/wheel.rs",
+    "line": 73,
+    "col": 32
+  },
+  {
+    "code": "clippy::elidable_lifetime_names",
+    "message": "the following explicit lifetimes could be elided: 'id",
+    "file": "titan/src/runtime/timing/wheel.rs",
+    "line": 279,
+    "col": 18
+  },
+  {
+    "code": "clippy::unreadable_literal",
+    "message": "long literal lacking separators",
+    "file": "titan/src/runtime/timing/wheel.rs",
+    "line": 507,
+    "col": 45
+  },
+  {
+    "code": "clippy::cast_possible_truncation",
+    "message": "casting `usize` to `u32` may truncate the value on targets with 64-bit wide pointers",
+    "file": "titan/src/runtime/timing/wheel.rs",
+    "line": 522,
+    "col": 81
+  },
+  {
+    "code": "clippy::manual_div_ceil",
+    "message": "manually reimplementing `div_ceil`",
+    "file": "titan/src/runtime/timing/wheel.rs",
+    "line": 524,
+    "col": 44
+  },
+  {
+    "code": "clippy::explicit_iter_loop",
+    "message": "it is more concise to loop over references to containers instead of using explicit iteration methods",
+    "file": "titan/src/runtime/timing/wheel.rs",
+    "line": 560,
+    "col": 43
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) module inside private module",
+    "file": "titan/src/spsc.rs",
+    "line": 7,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) struct inside private module",
+    "file": "titan/src/spsc/ring.rs",
+    "line": 18,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) struct inside private module",
+    "file": "titan/src/spsc/ring.rs",
+    "line": 21,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) struct inside private module",
+    "file": "titan/src/spsc/ring.rs",
+    "line": 24,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) struct inside private module",
+    "file": "titan/src/spsc/ring.rs",
+    "line": 32,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) type alias inside private module",
+    "file": "titan/src/spsc/ring.rs",
+    "line": 52,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) type alias inside private module",
+    "file": "titan/src/spsc/ring.rs",
+    "line": 55,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) type alias inside private module",
+    "file": "titan/src/spsc/ring.rs",
+    "line": 58,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) struct inside private module",
+    "file": "titan/src/spsc/ring.rs",
+    "line": 63,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) struct inside private module",
+    "file": "titan/src/spsc/ring.rs",
+    "line": 94,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) struct inside private module",
+    "file": "titan/src/spsc/ring.rs",
+    "line": 124,
+    "col": 1
+  },
+  {
+    "code": "clippy::redundant_pub_crate",
+    "message": "pub(crate) struct inside private module",
+    "file": "titan/src/spsc/ring.rs",
+    "line": 133,
+    "col": 1
+  },
+  {
+    "code": "clippy::doc_markdown",
+    "message": "item in documentation is missing backticks",
+    "file": "titan/src/sync/spsc.rs",
+    "line": 66,
+    "col": 23
+  },
+  {
+    "code": "clippy::cast_possible_truncation",
+    "message": "casting `u64` to `usize` may truncate the value on targets with 32-bit wide pointers",
+    "file": "titan/src/sync/spsc.rs",
+    "line": 376,
+    "col": 51
+  },
+  {
+    "code": "clippy::cast_possible_truncation",
+    "message": "casting `u64` to `usize` may truncate the value on targets with 32-bit wide pointers",
+    "file": "titan/src/sync/spsc.rs",
+    "line": 377,
+    "col": 36
+  },
+  {
+    "code": "clippy::missing_const_for_fn",
+    "message": "this could be a `const fn`",
+    "file": "titan/src/trace.rs",
+    "line": 32,
+    "col": 1
+  }
+]

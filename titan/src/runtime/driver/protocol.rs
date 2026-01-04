@@ -3,27 +3,32 @@
 //! This module defines the frames exchanged between drivers for:
 //! - Subscription setup with type validation
 //! - Flow control via Status Messages
+//! - Reliable delivery via NAK-based retransmission
 //! - Graceful teardown
 //!
 //! # Wire Format
 //!
-//! All frames share a common 8-byte header:
+//! All frames share a common 12-byte header:
 //!
 //! ```text
 //! ┌─────────┬─────────┬─────────┬───────────────────────────────────┐
-//! │ Type(1) │ Flags(1)│ Len(2)  │ Session ID (4)                    │
+//! │ Type(1) │ Flags(1)│ Len(2)  │ Session ID (8)                    │
 //! └─────────┴─────────┴─────────┴───────────────────────────────────┘
 //! ```
 //!
-//! Frame types:
-//! - 0x01 = SETUP (subscriber → publisher)
-//! - 0x02 = `SETUP_ACK` (publisher → subscriber)
-//! - 0x03 = `SETUP_NAK` (publisher → subscriber)
-//! - 0x04 = SM - Status Message (subscriber → publisher)
-//! - 0x05 = TEARDOWN (either direction)
+//! ## Session Management (0x10-0x14)
+//! - 0x10 = SETUP (subscriber → publisher)
+//! - 0x11 = SETUP_ACK (publisher → subscriber)
+//! - 0x12 = SETUP_NAK (publisher → subscriber)
+//! - 0x13 = STATUS_MSG (subscriber → publisher)
+//! - 0x14 = TEARDOWN (either direction)
+//! - 0x15 = HEARTBEAT (publisher → subscriber)
 //!
-//! Note: DATA frames use the existing [`DataPlaneMessage`] format from
-//! [`crate::data::transport`] - they don't go through this protocol layer.
+//! ## Data Plane (0x20-0x23)
+//! - 0x20 = DATA (publisher → subscriber)
+//! - 0x21 = DATA_FRAG (publisher → subscriber, fragmented)
+//! - 0x22 = NAK_BITMAP (subscriber → publisher)
+//! - 0x23 = DATA_NOT_AVAIL (publisher → subscriber)
 //!
 //! # Integration with Transport Modes
 //!
@@ -31,7 +36,7 @@
 //! All protocol frames travel directly between driver endpoints.
 //!
 //! ## Multicast (Future)
-//! - SETUP/`SETUP_ACK`/`SETUP_NAK`: Always unicast (subscriber knows publisher address)
+//! - SETUP/SETUP_ACK/SETUP_NAK: Always unicast (subscriber knows publisher address)
 //! - SM: Unicast back to publisher (like Aeron)
 //! - DATA: Goes to multicast group address
 //! - TEARDOWN: Unicast
@@ -80,17 +85,25 @@ impl FrameKind {
 
 /// Protocol frame type discriminants.
 ///
-/// These start at 0x10 to avoid collision with data plane message tags (0x00-0x03).
-/// This allows the RX thread to quickly distinguish protocol frames from data frames
-/// by checking if the first byte is >= 0x10.
+/// Types 0x10-0x1F are session management frames.
+/// Types 0x20-0x2F are data plane frames.
+/// This allows the RX thread to quickly distinguish frame categories.
 pub mod frame_type {
     use super::FrameKind;
 
+    // Session management frames (0x10-0x1F)
     pub const SETUP: u8 = 0x10;
     pub const SETUP_ACK: u8 = 0x11;
     pub const SETUP_NAK: u8 = 0x12;
     pub const STATUS_MESSAGE: u8 = 0x13;
     pub const TEARDOWN: u8 = 0x14;
+    pub const HEARTBEAT: u8 = 0x15;
+
+    // Data plane frames (0x20-0x2F)
+    pub const DATA: u8 = 0x20;
+    pub const DATA_FRAG: u8 = 0x21;
+    pub const NAK_BITMAP: u8 = 0x22;
+    pub const DATA_NOT_AVAIL: u8 = 0x23;
 
     /// Classify frame type from first byte.
     #[inline]
@@ -98,49 +111,99 @@ pub mod frame_type {
     pub const fn classify(first_byte: u8) -> FrameKind {
         FrameKind::from_first_byte(first_byte)
     }
+
+    /// Returns true if this is a session management frame (0x10-0x1F).
+    #[inline]
+    #[must_use]
+    pub const fn is_session_frame(frame_type: u8) -> bool {
+        frame_type >= 0x10 && frame_type < 0x20
+    }
+
+    /// Returns true if this is a data plane frame (0x20-0x2F).
+    #[inline]
+    #[must_use]
+    pub const fn is_data_frame(frame_type: u8) -> bool {
+        frame_type >= 0x20 && frame_type < 0x30
+    }
 }
 
 /// Common header for all protocol frames.
 ///
 /// ```text
 /// ┌─────────┬─────────┬─────────┬───────────────────────────────────┐
-/// │ Type(1) │ Flags(1)│ Len(2)  │ Session ID (4)                    │
+/// │ Type(1) │ Flags(1)│ Len(2)  │ Session ID (8)                    │
 /// └─────────┴─────────┴─────────┴───────────────────────────────────┘
 /// ```
-pub const HEADER_SIZE: usize = 8;
+pub const HEADER_SIZE: usize = 12;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Global session counter for generating unique session IDs.
+/// Upper 32 bits: timestamp at init, lower 32 bits: counter.
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Initialize the session counter with current timestamp.
+/// Should be called once at driver startup.
+pub fn init_session_counter() {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Upper 32 bits = timestamp, lower 32 bits = 0 (counter starts at 0)
+    SESSION_COUNTER.store(ts << 32, Ordering::Relaxed);
+}
 
 /// Session identifier for correlating protocol exchanges.
 ///
-/// Generated randomly by the subscriber when initiating SETUP.
-/// Echoed by the publisher in `SETUP_ACK`/`SETUP_NAK`.
+/// Format: `[timestamp_seconds:32][counter:32]`
+/// - Upper 32 bits: Unix timestamp at driver start (seconds)
+/// - Lower 32 bits: Incrementing counter
 ///
-/// Invariant: Opaque. Generated via `SessionId::generate()`, never user-constructed.
+/// This ensures:
+/// - No collisions within a driver instance (counter)
+/// - No collisions across restarts (timestamp prefix)
+/// - Monotonically increasing within a session
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SessionId(u32);
+pub struct SessionId(u64);
 
 impl SessionId {
-    /// Generate a new random session ID.
+    /// Generate a new unique session ID.
+    ///
+    /// Thread-safe: uses atomic increment.
     #[must_use]
     pub fn generate() -> Self {
-        Self(rand::random())
+        Self(SESSION_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Raw value for wire serialization.
     #[must_use]
-    pub const fn as_u32(self) -> u32 {
+    pub const fn as_u64(self) -> u64 {
         self.0
+    }
+
+    /// Extracts the timestamp component (upper 32 bits).
+    #[must_use]
+    pub const fn timestamp(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    /// Extracts the counter component (lower 32 bits).
+    #[must_use]
+    pub const fn counter(self) -> u32 {
+        self.0 as u32
     }
 }
 
-impl From<u32> for SessionId {
-    fn from(v: u32) -> Self {
+impl From<u64> for SessionId {
+    fn from(v: u64) -> Self {
         Self(v)
     }
 }
 
 impl fmt::Display for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:08x}", self.0)
+        write!(f, "{:016x}", self.0)
     }
 }
 
@@ -230,16 +293,18 @@ impl From<u64> for ConsumptionOffset {
     }
 }
 
-/// Reasons for rejecting a subscription.
+/// Reasons for rejecting a subscription (SETUP_NAK).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NakReason {
-    /// Type hash doesn't match the channel's published type.
-    TypeMismatch = 0x01,
     /// Requested channel doesn't exist on this driver.
-    ChannelNotFound = 0x02,
+    UnknownChannel = 0x01,
+    /// Type hash doesn't match the channel's published type.
+    TypeMismatch = 0x02,
+    /// Subscriber not authorized to access this channel.
+    NotAuthorized = 0x03,
     /// Driver has reached maximum subscription capacity.
-    CapacityExceeded = 0x03,
+    ResourceExhausted = 0x04,
     /// Generic/unknown error.
     Unknown = 0xFF,
 }
@@ -247,9 +312,35 @@ pub enum NakReason {
 impl From<u8> for NakReason {
     fn from(v: u8) -> Self {
         match v {
-            0x01 => Self::TypeMismatch,
-            0x02 => Self::ChannelNotFound,
-            0x03 => Self::CapacityExceeded,
+            0x01 => Self::UnknownChannel,
+            0x02 => Self::TypeMismatch,
+            0x03 => Self::NotAuthorized,
+            0x04 => Self::ResourceExhausted,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Reasons for teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TeardownReason {
+    /// Clean shutdown requested by application.
+    Normal = 0x00,
+    /// Session timed out (no activity).
+    Timeout = 0x01,
+    /// Internal error occurred.
+    Error = 0x02,
+    /// Unknown reason.
+    Unknown = 0xFF,
+}
+
+impl From<u8> for TeardownReason {
+    fn from(v: u8) -> Self {
+        match v {
+            0x00 => Self::Normal,
+            0x01 => Self::Timeout,
+            0x02 => Self::Error,
             _ => Self::Unknown,
         }
     }
@@ -288,9 +379,11 @@ pub struct SetupFrame {
 ///
 /// ```text
 /// ┌──────────────────────────────────────────────────────────────────┐
-/// │ Header: Type=0x02, Session ID (echo from SETUP)                  │
+/// │ Header: Type=0x11, Session ID (echo from SETUP)                  │
 /// ├──────────────────────────────────────────────────────────────────┤
-/// │ Publisher Session ID (4 bytes) - for subscriber to use in SM     │
+/// │ Publisher Session ID (8 bytes) - for subscriber to use in SM     │
+/// ├──────────────────────────────────────────────────────────────────┤
+/// │ First Seq (8 bytes) - first sequence number subscriber expects   │
 /// ├──────────────────────────────────────────────────────────────────┤
 /// │ MTU (2 bytes) - negotiated (min of both)                         │
 /// └──────────────────────────────────────────────────────────────────┘
@@ -301,6 +394,8 @@ pub struct SetupAckFrame {
     pub session: SessionId,
     /// Publisher's session ID for the subscriber to use in Status Messages.
     pub publisher_session: SessionId,
+    /// First sequence number the subscriber should expect.
+    pub first_seq: u64,
     /// Negotiated MTU (minimum of subscriber and publisher).
     pub mtu: Mtu,
 }
@@ -352,23 +447,152 @@ pub struct StatusMessageFrame {
 ///
 /// ```text
 /// ┌──────────────────────────────────────────────────────────────────┐
-/// │ Header: Type=0x05, Session ID                                    │
+/// │ Header: Type=0x14, Session ID                                    │
+/// ├──────────────────────────────────────────────────────────────────┤
+/// │ Reason (1 byte)                                                  │
 /// └──────────────────────────────────────────────────────────────────┘
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TeardownFrame {
     /// Session ID of the subscription being closed.
     pub session: SessionId,
+    /// Reason for teardown.
+    pub reason: TeardownReason,
+}
+
+/// HEARTBEAT frame: publisher liveness probe.
+///
+/// Sent periodically by publisher to:
+/// 1. Maintain session liveness
+/// 2. Communicate next expected sequence number (for gap detection)
+///
+/// ```text
+/// ┌──────────────────────────────────────────────────────────────────┐
+/// │ Header: Type=0x15, Session ID (publisher's session)              │
+/// ├──────────────────────────────────────────────────────────────────┤
+/// │ Next Seq (8 bytes) - next sequence number publisher will send    │
+/// └──────────────────────────────────────────────────────────────────┘
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatFrame {
+    /// Publisher's session ID.
+    pub session: SessionId,
+    /// Next sequence number the publisher will send.
+    /// Subscriber uses this for gap detection during idle periods.
+    pub next_seq: u64,
+}
+
+/// NAK_BITMAP frame: subscriber requests retransmission of missing data.
+///
+/// Uses bitmap encoding for efficient representation of gaps.
+///
+/// ```text
+/// ┌──────────────────────────────────────────────────────────────────┐
+/// │ Header: Type=0x22, Session ID (publisher's session)              │
+/// ├──────────────────────────────────────────────────────────────────┤
+/// │ Channel ID (4 bytes)                                             │
+/// ├──────────────────────────────────────────────────────────────────┤
+/// │ Entry Count (2 bytes)                                            │
+/// ├──────────────────────────────────────────────────────────────────┤
+/// │ Entry 0: Base Seq (8 bytes)                                      │
+/// ├──────────────────────────────────────────────────────────────────┤
+/// │ Entry 0: Bitmap (8 bytes) - bit i: 1=received, 0=missing         │
+/// ├──────────────────────────────────────────────────────────────────┤
+/// │ ... more entries ...                                             │
+/// └──────────────────────────────────────────────────────────────────┘
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NakBitmapFrame {
+    /// Publisher's session ID.
+    pub session: SessionId,
+    /// Channel with missing data.
+    pub channel: ChannelId,
+    /// Bitmap entries: (base_seq, bitmap) pairs.
+    /// Each bitmap covers 64 sequence numbers starting at base_seq.
+    /// Bit i = 1 means base_seq + i was received, 0 means missing.
+    pub entries: Vec<NakBitmapEntry>,
+}
+
+/// A single NAK bitmap entry covering 64 sequence numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NakBitmapEntry {
+    /// Starting sequence number for this bitmap.
+    pub base_seq: u64,
+    /// Bitmap: bit i = 1 means base_seq + i received, 0 means missing.
+    pub bitmap: u64,
+}
+
+impl NakBitmapEntry {
+    /// Returns true if this entry has any missing sequences (any bit is 0).
+    #[inline]
+    #[must_use]
+    pub const fn has_missing(&self) -> bool {
+        self.bitmap != u64::MAX
+    }
+
+    /// Returns the number of missing sequences in this entry.
+    #[must_use]
+    pub const fn missing_count(&self) -> u32 {
+        64 - self.bitmap.count_ones()
+    }
+
+    /// Returns an iterator over the missing sequence numbers in this entry.
+    pub fn missing_sequences(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..64).filter_map(move |i| {
+            if (self.bitmap & (1 << i)) == 0 {
+                Some(self.base_seq.wrapping_add(i))
+            } else {
+                None
+            }
+        })
+    }
+}
+
+/// DATA_NOT_AVAIL frame: publisher indicates data is no longer available.
+///
+/// Sent in response to NAK when requested data has been evicted from
+/// the retransmit buffer.
+///
+/// ```text
+/// ┌──────────────────────────────────────────────────────────────────┐
+/// │ Header: Type=0x23, Session ID (publisher's session)              │
+/// ├──────────────────────────────────────────────────────────────────┤
+/// │ Channel ID (4 bytes)                                             │
+/// ├──────────────────────────────────────────────────────────────────┤
+/// │ Unavailable Start Seq (8 bytes) - first unavailable (inclusive)  │
+/// ├──────────────────────────────────────────────────────────────────┤
+/// │ Unavailable End Seq (8 bytes) - last unavailable (exclusive)     │
+/// ├──────────────────────────────────────────────────────────────────┤
+/// │ Oldest Available (8 bytes) - oldest seq still in buffer          │
+/// └──────────────────────────────────────────────────────────────────┘
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataNotAvailFrame {
+    /// Publisher's session ID.
+    pub session: SessionId,
+    /// Channel.
+    pub channel: ChannelId,
+    /// First unavailable sequence number (inclusive).
+    pub unavail_start: u64,
+    /// Last unavailable sequence number (exclusive).
+    pub unavail_end: u64,
+    /// Oldest sequence number still available in retransmit buffer.
+    pub oldest_available: u64,
 }
 
 /// All protocol frame variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolFrame {
+    // Session management
     Setup(SetupFrame),
     SetupAck(SetupAckFrame),
     SetupNak(SetupNakFrame),
     StatusMessage(StatusMessageFrame),
     Teardown(TeardownFrame),
+    Heartbeat(HeartbeatFrame),
+    // Data plane control
+    NakBitmap(NakBitmapFrame),
+    DataNotAvail(DataNotAvailFrame),
 }
 
 /// Errors during protocol encode/decode.
@@ -418,7 +642,7 @@ impl<'a> FrameWriter<'a> {
         self.put_u8(flags);
         let len_pos = self.buf.len();
         self.put_u16(0); // placeholder for length
-        self.put_u32(session.as_u32());
+        self.put_u64(session.as_u64());
         len_pos
     }
 
@@ -518,7 +742,8 @@ pub fn encode_frame(frame: &ProtocolFrame, buf: &mut Vec<u8>) -> Result<(), Prot
         }
         ProtocolFrame::SetupAck(f) => {
             let len_pos = w.write_header(frame_type::SETUP_ACK, 0, f.session);
-            w.put_u32(f.publisher_session.as_u32());
+            w.put_u64(f.publisher_session.as_u64());
+            w.put_u64(f.first_seq);
             w.put_u16(f.mtu.as_u16());
             w.patch_length(len_pos);
         }
@@ -535,11 +760,78 @@ pub fn encode_frame(frame: &ProtocolFrame, buf: &mut Vec<u8>) -> Result<(), Prot
         }
         ProtocolFrame::Teardown(f) => {
             let len_pos = w.write_header(frame_type::TEARDOWN, 0, f.session);
+            w.put_u8(f.reason as u8);
+            w.patch_length(len_pos);
+        }
+        ProtocolFrame::Heartbeat(f) => {
+            let len_pos = w.write_header(frame_type::HEARTBEAT, 0, f.session);
+            w.put_u64(f.next_seq);
+            w.patch_length(len_pos);
+        }
+        ProtocolFrame::NakBitmap(f) => {
+            let len_pos = w.write_header(frame_type::NAK_BITMAP, 0, f.session);
+            w.put_u32(f.channel.into());
+            w.put_u16(f.entries.len() as u16);
+            w.put_u16(0); // reserved
+            for entry in &f.entries {
+                w.put_u64(entry.base_seq);
+                w.put_u64(entry.bitmap);
+            }
+            w.patch_length(len_pos);
+        }
+        ProtocolFrame::DataNotAvail(f) => {
+            let len_pos = w.write_header(frame_type::DATA_NOT_AVAIL, 0, f.session);
+            w.put_u32(f.channel.into());
+            w.put_u64(f.unavail_start);
+            w.put_u64(f.unavail_end);
+            w.put_u64(f.oldest_available);
             w.patch_length(len_pos);
         }
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Convenience encode functions for specific frame types
+// ============================================================================
+
+/// Encodes a HEARTBEAT frame directly.
+///
+/// # Errors
+/// Currently infallible but returns `Result` for consistency.
+pub fn encode_heartbeat(frame: &HeartbeatFrame, buf: &mut Vec<u8>) -> Result<(), ProtocolError> {
+    encode_frame(&ProtocolFrame::Heartbeat(frame.clone()), buf)
+}
+
+/// Encodes a DATA_NOT_AVAIL frame directly.
+///
+/// # Errors
+/// Currently infallible but returns `Result` for consistency.
+pub fn encode_data_not_avail(
+    frame: &DataNotAvailFrame,
+    buf: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+    encode_frame(&ProtocolFrame::DataNotAvail(frame.clone()), buf)
+}
+
+/// Encodes a NAK_BITMAP frame directly.
+///
+/// # Errors
+/// Currently infallible but returns `Result` for consistency.
+pub fn encode_nak_bitmap(frame: &NakBitmapFrame, buf: &mut Vec<u8>) -> Result<(), ProtocolError> {
+    encode_frame(&ProtocolFrame::NakBitmap(frame.clone()), buf)
+}
+
+/// Encodes a STATUS_MSG frame directly.
+///
+/// # Errors
+/// Currently infallible but returns `Result` for consistency.
+pub fn encode_status_message(
+    frame: &StatusMessageFrame,
+    buf: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+    encode_frame(&ProtocolFrame::StatusMessage(frame.clone()), buf)
 }
 
 /// Decode a protocol frame from bytes.
@@ -549,11 +841,11 @@ pub fn encode_frame(frame: &ProtocolFrame, buf: &mut Vec<u8>) -> Result<(), Prot
 pub fn decode_frame(bytes: &[u8]) -> Result<ProtocolFrame, ProtocolError> {
     let mut r = FrameReader::new(bytes);
 
-    // Read header
+    // Read header (12 bytes)
     let frame_type = r.take_u8()?;
     let _flags = r.take_u8()?;
     let _len = r.take_u16()?;
-    let session = SessionId::from(r.take_u32()?);
+    let session = SessionId::from(r.take_u64()?);
 
     match frame_type {
         frame_type::SETUP => {
@@ -570,11 +862,13 @@ pub fn decode_frame(bytes: &[u8]) -> Result<ProtocolFrame, ProtocolError> {
             }))
         }
         frame_type::SETUP_ACK => {
-            let publisher_session = SessionId::from(r.take_u32()?);
+            let publisher_session = SessionId::from(r.take_u64()?);
+            let first_seq = r.take_u64()?;
             let mtu = Mtu::from(r.take_u16()?);
             Ok(ProtocolFrame::SetupAck(SetupAckFrame {
                 session,
                 publisher_session,
+                first_seq,
                 mtu,
             }))
         }
@@ -591,7 +885,43 @@ pub fn decode_frame(bytes: &[u8]) -> Result<ProtocolFrame, ProtocolError> {
                 receiver_window,
             }))
         }
-        frame_type::TEARDOWN => Ok(ProtocolFrame::Teardown(TeardownFrame { session })),
+        frame_type::TEARDOWN => {
+            let reason = TeardownReason::from(r.take_u8()?);
+            Ok(ProtocolFrame::Teardown(TeardownFrame { session, reason }))
+        }
+        frame_type::HEARTBEAT => {
+            let next_seq = r.take_u64()?;
+            Ok(ProtocolFrame::Heartbeat(HeartbeatFrame { session, next_seq }))
+        }
+        frame_type::NAK_BITMAP => {
+            let channel = ChannelId::from(r.take_u32()?);
+            let entry_count = r.take_u16()? as usize;
+            let _reserved = r.take_u16()?;
+            let mut entries = Vec::with_capacity(entry_count);
+            for _ in 0..entry_count {
+                let base_seq = r.take_u64()?;
+                let bitmap = r.take_u64()?;
+                entries.push(NakBitmapEntry { base_seq, bitmap });
+            }
+            Ok(ProtocolFrame::NakBitmap(NakBitmapFrame {
+                session,
+                channel,
+                entries,
+            }))
+        }
+        frame_type::DATA_NOT_AVAIL => {
+            let channel = ChannelId::from(r.take_u32()?);
+            let unavail_start = r.take_u64()?;
+            let unavail_end = r.take_u64()?;
+            let oldest_available = r.take_u64()?;
+            Ok(ProtocolFrame::DataNotAvail(DataNotAvailFrame {
+                session,
+                channel,
+                unavail_start,
+                unavail_end,
+                oldest_available,
+            }))
+        }
         other => Err(ProtocolError::UnknownFrameType(other)),
     }
 }
@@ -603,9 +933,9 @@ mod tests {
     #[test]
     fn roundtrip_setup() {
         let frame = ProtocolFrame::Setup(SetupFrame {
-            session: SessionId::from(0x12345678),
+            session: SessionId::from(0x1234_5678_9ABC_DEF0),
             channel: ChannelId::from(42),
-            type_id: TypeId::from(0xDEADBEEF_CAFEBABE),
+            type_id: TypeId::from(0xDEAD_BEEF_CAFE_BABE),
             receiver_window: ReceiverWindow::new(128 * 1024),
             mtu: Mtu::new(1500),
         });
@@ -620,8 +950,9 @@ mod tests {
     #[test]
     fn roundtrip_setup_ack() {
         let frame = ProtocolFrame::SetupAck(SetupAckFrame {
-            session: SessionId::from(0x11111111),
-            publisher_session: SessionId::from(0x22222222),
+            session: SessionId::from(0x1111_1111_1111_1111),
+            publisher_session: SessionId::from(0x2222_2222_2222_2222),
+            first_seq: 12345,
             mtu: Mtu::new(1400),
         });
 
@@ -635,7 +966,7 @@ mod tests {
     #[test]
     fn roundtrip_setup_nak() {
         let frame = ProtocolFrame::SetupNak(SetupNakFrame {
-            session: SessionId::from(0xAAAAAAAA),
+            session: SessionId::from(0xAAAA_AAAA_AAAA_AAAA),
             reason: NakReason::TypeMismatch,
         });
 
@@ -649,7 +980,7 @@ mod tests {
     #[test]
     fn roundtrip_status_message() {
         let frame = ProtocolFrame::StatusMessage(StatusMessageFrame {
-            session: SessionId::from(0xBBBBBBBB),
+            session: SessionId::from(0xBBBB_BBBB_BBBB_BBBB),
             consumption_offset: ConsumptionOffset::from(999_999),
             receiver_window: ReceiverWindow::new(64 * 1024),
         });
@@ -664,7 +995,8 @@ mod tests {
     #[test]
     fn roundtrip_teardown() {
         let frame = ProtocolFrame::Teardown(TeardownFrame {
-            session: SessionId::from(0xCCCCCCCC),
+            session: SessionId::from(0xCCCC_CCCC_CCCC_CCCC),
+            reason: TeardownReason::Normal,
         });
 
         let mut buf = Vec::new();
@@ -672,6 +1004,76 @@ mod tests {
         let decoded = decode_frame(&buf).unwrap();
 
         assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn roundtrip_heartbeat() {
+        let frame = ProtocolFrame::Heartbeat(HeartbeatFrame {
+            session: SessionId::from(0xDDDD_DDDD_DDDD_DDDD),
+            next_seq: 42_000,
+        });
+
+        let mut buf = Vec::new();
+        encode_frame(&frame, &mut buf).unwrap();
+        let decoded = decode_frame(&buf).unwrap();
+
+        assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn roundtrip_nak_bitmap() {
+        let frame = ProtocolFrame::NakBitmap(NakBitmapFrame {
+            session: SessionId::from(0xEEEE_EEEE_EEEE_EEEE),
+            channel: ChannelId::from(7),
+            entries: vec![
+                NakBitmapEntry {
+                    base_seq: 100,
+                    bitmap: 0b1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_0101,
+                },
+                NakBitmapEntry {
+                    base_seq: 200,
+                    bitmap: 0b1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_0000_0000,
+                },
+            ],
+        });
+
+        let mut buf = Vec::new();
+        encode_frame(&frame, &mut buf).unwrap();
+        let decoded = decode_frame(&buf).unwrap();
+
+        assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn roundtrip_data_not_avail() {
+        let frame = ProtocolFrame::DataNotAvail(DataNotAvailFrame {
+            session: SessionId::from(0xFFFF_FFFF_FFFF_FFFF),
+            channel: ChannelId::from(99),
+            unavail_start: 500,
+            unavail_end: 600,
+            oldest_available: 600,
+        });
+
+        let mut buf = Vec::new();
+        encode_frame(&frame, &mut buf).unwrap();
+        let decoded = decode_frame(&buf).unwrap();
+
+        assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn nak_bitmap_missing_sequences() {
+        // Bitmap: bit 0 = 1 (received), bit 1 = 0 (missing), bit 2 = 1, bit 3 = 0
+        let entry = NakBitmapEntry {
+            base_seq: 100,
+            bitmap: 0b0101, // bits 0,2 set (received), bits 1,3 missing
+        };
+        let missing: Vec<u64> = entry.missing_sequences().take(10).collect();
+        // All bits 4-63 are 0 (missing), plus bits 1 and 3
+        assert!(missing.contains(&101)); // bit 1 = 0
+        assert!(missing.contains(&103)); // bit 3 = 0
+        assert!(!missing.contains(&100)); // bit 0 = 1
+        assert!(!missing.contains(&102)); // bit 2 = 1
     }
 
     #[test]
@@ -685,25 +1087,54 @@ mod tests {
 
     #[test]
     fn decode_unknown_frame_type() {
-        // Valid header but unknown type
-        let bytes = [0xFF, 0x00, 0x08, 0x00, 0x01, 0x02, 0x03, 0x04];
+        // Valid 12-byte header but unknown type
+        let bytes = [0xFF, 0x00, 0x0C, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         let result = decode_frame(&bytes);
         assert!(matches!(result, Err(ProtocolError::UnknownFrameType(0xFF))));
     }
 
     #[test]
     fn nak_reason_roundtrip() {
-        assert_eq!(NakReason::from(0x01), NakReason::TypeMismatch);
-        assert_eq!(NakReason::from(0x02), NakReason::ChannelNotFound);
-        assert_eq!(NakReason::from(0x03), NakReason::CapacityExceeded);
+        assert_eq!(NakReason::from(0x01), NakReason::UnknownChannel);
+        assert_eq!(NakReason::from(0x02), NakReason::TypeMismatch);
+        assert_eq!(NakReason::from(0x03), NakReason::NotAuthorized);
+        assert_eq!(NakReason::from(0x04), NakReason::ResourceExhausted);
         assert_eq!(NakReason::from(0x99), NakReason::Unknown);
     }
 
     #[test]
-    fn session_id_generate_is_random() {
+    fn teardown_reason_roundtrip() {
+        assert_eq!(TeardownReason::from(0x00), TeardownReason::Normal);
+        assert_eq!(TeardownReason::from(0x01), TeardownReason::Timeout);
+        assert_eq!(TeardownReason::from(0x02), TeardownReason::Error);
+        assert_eq!(TeardownReason::from(0x99), TeardownReason::Unknown);
+    }
+
+    #[test]
+    fn session_id_generate_increments() {
+        init_session_counter();
         let s1 = SessionId::generate();
         let s2 = SessionId::generate();
-        // Very unlikely to be equal
-        assert_ne!(s1, s2);
+        // Counter should increment
+        assert_eq!(s2.counter(), s1.counter() + 1);
+        // Timestamp should be the same (within same second)
+        assert_eq!(s2.timestamp(), s1.timestamp());
+    }
+
+    #[test]
+    fn header_size_is_12() {
+        // Verify header size matches spec
+        assert_eq!(HEADER_SIZE, 12);
+
+        // Encode a minimal frame and check header
+        let frame = ProtocolFrame::Teardown(TeardownFrame {
+            session: SessionId::from(0),
+            reason: TeardownReason::Normal,
+        });
+        let mut buf = Vec::new();
+        encode_frame(&frame, &mut buf).unwrap();
+
+        // Header (12) + reason (1) = 13
+        assert_eq!(buf.len(), 13);
     }
 }

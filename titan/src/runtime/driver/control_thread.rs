@@ -8,12 +8,12 @@
 //! - Process driver-driver protocol events (SETUP, TEARDOWN).
 
 use std::collections::HashMap;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use minstant::Instant;
-
+use crate::runtime::timing::{Duration as WheelDuration, Millis, NonZeroDuration, WheelScope, with_wheel};
 use crate::trace::{debug, info, warn};
 
 use crate::control::handshake::driver_accept;
@@ -39,12 +39,26 @@ use super::protocol::{
 
 type DriverConnection = ControlConnection<DriverRole>;
 
+/// Timing wheel slots (covers ~255ms max delay at 1ms tick).
+/// Session timeouts are typically 30s, so we use larger wheel.
+const WHEEL_SLOTS: usize = 512;
+
+/// Timing wheel capacity (max concurrent timers).
+const WHEEL_CAPACITY: usize = 256;
+
+/// Timer event types for control thread.
+#[derive(Debug, Clone, Copy)]
+enum ControlTimerEvent {
+    /// Session timeout for a client.
+    SessionTimeout(ClientId),
+}
+
 /// Per-client session state.
 struct Session {
     /// Control connection to the client.
     conn: DriverConnection,
-    /// Last activity timestamp for timeout detection.
-    last_activity: Instant,
+    /// Whether a timeout timer is currently scheduled.
+    timeout_scheduled: bool,
     /// Channels owned by this client.
     channels: HashMap<ChannelId, ChannelDirection>,
 }
@@ -62,7 +76,7 @@ impl Session {
     fn new(conn: DriverConnection) -> Self {
         Self {
             conn,
-            last_activity: Instant::now(),
+            timeout_scheduled: false,
             channels: HashMap::new(),
         }
     }
@@ -173,22 +187,42 @@ impl ControlThread {
     ///
     /// Returns when shutdown is requested via the shutdown flag.
     pub fn run(&mut self) {
+        let tick_duration =
+            NonZeroDuration::<Millis>::new(NonZeroU64::new(1).expect("1 != 0"));
+        let capacity = NonZeroUsize::new(WHEEL_CAPACITY).expect("WHEEL_CAPACITY != 0");
+
+        with_wheel::<ControlTimerEvent, Millis, WHEEL_SLOTS, _>(tick_duration, capacity, |wheel| {
+            self.run_with_wheel(wheel);
+        });
+    }
+
+    /// Inner run loop with timing wheel.
+    fn run_with_wheel(
+        &mut self,
+        wheel: &mut WheelScope<'_, ControlTimerEvent, Millis, WHEEL_SLOTS>,
+    ) {
         while !self.shutdown_flag.load(Ordering::Relaxed) {
-            // Accept pending connections
-            self.accept_pending();
+            // Accept pending connections and schedule their timeout timers
+            self.accept_pending(wheel);
 
             // Process protocol events from RX thread
             self.process_protocol_events();
 
-            // Process client messages and check timeouts
-            let disconnected = self.tick();
+            // Process client messages (tracks activity for timeout reset)
+            let (disconnected, activity_clients) = self.tick(wheel);
 
             // Clean up disconnected sessions
             for client_id in disconnected {
                 self.cleanup_session(client_id);
             }
 
-            // TODO: Use timing wheel for session timeouts instead of polling
+            // Reset timeout timers for clients with activity
+            for client_id in activity_clients {
+                self.reset_timeout(client_id, wheel);
+            }
+
+            // Fire due timers (session timeouts)
+            self.tick_timers(wheel);
 
             // Brief sleep to avoid busy-spinning (1ms)
             std::thread::sleep(Duration::from_millis(1));
@@ -223,9 +257,10 @@ impl ControlThread {
                     from,
                     session,
                     publisher_session,
+                    first_seq,
                     mtu: _,
                 } => {
-                    self.handle_setup_ack(from, session, publisher_session);
+                    self.handle_setup_ack(from, session, publisher_session, first_seq);
                 }
                 RxToControlEvent::SetupNak {
                     from: _,
@@ -264,7 +299,7 @@ impl ControlThread {
         // Check if we have a publication for this channel
         let Some(publication) = self.publications.get(&channel) else {
             warn!(channel = %channel, from = %from, "SETUP rejected: channel not found");
-            self.send_setup_nak(from, session, NakReason::ChannelNotFound);
+            self.send_setup_nak(from, session, NakReason::UnknownChannel);
             return;
         };
 
@@ -295,21 +330,27 @@ impl ControlThread {
             session: publisher_session,
             endpoint: from,
             receiver_window,
+            mtu: negotiated_mtu,
         };
         if self.tx_commands.push(cmd).is_err() {
             warn!(channel = %channel, from = %from, "SETUP rejected: capacity exceeded");
-            self.send_setup_nak(from, session, NakReason::CapacityExceeded);
+            self.send_setup_nak(from, session, NakReason::ResourceExhausted);
             return;
         }
+
+        // TODO: Get first_seq from TX thread's current sequence for this channel
+        // For now, use 0 as starting sequence
+        let first_seq = 0u64;
 
         info!(
             channel = %channel,
             subscriber = %from,
             publisher_session = %publisher_session,
             negotiated_mtu = negotiated_mtu,
+            first_seq = first_seq,
             "SETUP accepted, sending ACK"
         );
-        self.send_setup_ack(from, session, publisher_session, negotiated_mtu);
+        self.send_setup_ack(from, session, publisher_session, first_seq, negotiated_mtu);
     }
 
     /// Sends a `SETUP_ACK` frame to a subscriber.
@@ -318,11 +359,13 @@ impl ControlThread {
         to: Endpoint,
         subscriber_session: SessionId,
         publisher_session: SessionId,
+        first_seq: u64,
         mtu: u16,
     ) {
         let frame = ProtocolFrame::SetupAck(SetupAckFrame {
             session: subscriber_session,
             publisher_session,
+            first_seq,
             mtu: Mtu::new(mtu),
         });
 
@@ -372,13 +415,17 @@ impl ControlThread {
         from: Endpoint,
         session: SessionId,
         publisher_session: SessionId,
+        first_seq: u64,
     ) {
         info!(
             from = %from,
             session = %session,
             publisher_session = %publisher_session,
+            first_seq = first_seq,
             "received SETUP_ACK"
         );
+        // TODO: Pass first_seq to reorder buffer initialization (Phase 5)
+        let _ = first_seq;
 
         // Find the pending subscription by our session ID
         let Some(pending) = self.pending_subscriptions.remove(&session) else {
@@ -464,9 +511,10 @@ impl ControlThread {
 
         // Convert NAK reason to subscription failure
         let failure = match reason {
+            NakReason::UnknownChannel => SubscriptionFailure::ChannelNotFound,
             NakReason::TypeMismatch => SubscriptionFailure::TypeMismatch,
-            NakReason::ChannelNotFound => SubscriptionFailure::ChannelNotFound,
-            NakReason::CapacityExceeded => SubscriptionFailure::CapacityExceeded,
+            NakReason::NotAuthorized => SubscriptionFailure::NetworkError, // TODO: Add NotAuthorized failure type
+            NakReason::ResourceExhausted => SubscriptionFailure::CapacityExceeded,
             NakReason::Unknown => SubscriptionFailure::NetworkError,
         };
 
@@ -559,13 +607,19 @@ impl ControlThread {
     }
 
     /// Accepts all pending connection requests.
-    fn accept_pending(&mut self) {
+    fn accept_pending(
+        &mut self,
+        wheel: &mut WheelScope<'_, ControlTimerEvent, Millis, WHEEL_SLOTS>,
+    ) {
         while let Some(client_id) = self.inbox.pop() {
             debug!(client_id = %client_id, "accepting client from inbox");
             match driver_accept(client_id) {
                 Ok(conn) => {
                     info!(client_id = %client_id, "client session established");
-                    self.sessions.insert(conn.id, Session::new(conn));
+                    let id = conn.id;
+                    self.sessions.insert(id, Session::new(conn));
+                    // Schedule initial timeout timer
+                    self.schedule_timeout(id, wheel);
                 }
                 Err(_e) => {
                     warn!(client_id = %client_id, error = ?_e, "failed to accept client");
@@ -574,10 +628,13 @@ impl ControlThread {
         }
     }
 
-    /// Processes messages from all sessions and detects timeouts.
+    /// Processes messages from all sessions.
     ///
-    /// Returns IDs of clients that should be disconnected.
-    fn tick(&mut self) -> Vec<ClientId> {
+    /// Returns (disconnected clients, clients with activity).
+    fn tick(
+        &mut self,
+        _wheel: &mut WheelScope<'_, ControlTimerEvent, Millis, WHEEL_SLOTS>,
+    ) -> (Vec<ClientId>, Vec<ClientId>) {
         let mut disconnected = Vec::new();
         let mut new_publications = Vec::new();
         let mut new_remote_subscriptions: Vec<(
@@ -587,14 +644,15 @@ impl ControlThread {
             RemoteEndpoint,
             ChannelId,
         )> = Vec::new();
-        let now = Instant::now();
-        let session_timeout = self.session_timeout;
+        let mut activity_clients = Vec::new();
 
         for session in self.sessions.values_mut() {
+            let mut had_activity = false;
+
             // Process pending messages
             while let Some(msg) = session.conn.rx.pop() {
                 if let Ok(cmd) = ClientCommand::try_from(msg) {
-                    session.last_activity = now;
+                    had_activity = true;
 
                     match cmd {
                         ClientCommand::Disconnect => {
@@ -602,7 +660,7 @@ impl ControlThread {
                             break;
                         }
                         ClientCommand::Heartbeat => {
-                            // Just update last_activity (already done above)
+                            // Activity already tracked
                         }
                         ClientCommand::OpenTx { channel, type_id } => {
                             if let Some(pub_info) = Self::handle_open_tx(
@@ -647,12 +705,9 @@ impl ControlThread {
                 }
             }
 
-            // Check for timeout
-            if now.duration_since(session.last_activity) > session_timeout {
-                if session.conn.tx.push(DriverMessage::Shutdown).is_err() {
-                    warn!(client = %session.conn.id, "client queue full, dropping Shutdown");
-                }
-                disconnected.push(session.conn.id);
+            // Track clients with activity (need to reset timeout timer)
+            if had_activity {
+                activity_clients.push(session.conn.id);
             }
         }
 
@@ -672,7 +727,7 @@ impl ControlThread {
             );
         }
 
-        disconnected
+        (disconnected, activity_clients)
     }
 
     /// Handles `OpenTx` command: client wants to send data to driver.
@@ -851,5 +906,77 @@ impl ControlThread {
     #[must_use]
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Schedules a session timeout timer for a client.
+    fn schedule_timeout(
+        &mut self,
+        client_id: ClientId,
+        wheel: &mut WheelScope<'_, ControlTimerEvent, Millis, WHEEL_SLOTS>,
+    ) {
+        if let Some(session) = self.sessions.get_mut(&client_id) {
+            if session.timeout_scheduled {
+                return;
+            }
+
+            let delay_ms = self.session_timeout.as_millis() as u64;
+            let delay = WheelDuration::<Millis>::from_millis(delay_ms);
+            if wheel
+                .schedule_after(delay, ControlTimerEvent::SessionTimeout(client_id))
+                .is_err()
+            {
+                warn!(client = %client_id, "failed to schedule session timeout (wheel full or delay too long)");
+                return;
+            }
+            session.timeout_scheduled = true;
+        }
+    }
+
+    /// Resets the timeout timer for a client with recent activity.
+    fn reset_timeout(
+        &mut self,
+        client_id: ClientId,
+        wheel: &mut WheelScope<'_, ControlTimerEvent, Millis, WHEEL_SLOTS>,
+    ) {
+        if let Some(session) = self.sessions.get_mut(&client_id) {
+            // Clear the scheduled flag so we can reschedule
+            session.timeout_scheduled = false;
+        }
+        self.schedule_timeout(client_id, wheel);
+    }
+
+    /// Fires due session timeout timers.
+    fn tick_timers(
+        &mut self,
+        wheel: &mut WheelScope<'_, ControlTimerEvent, Millis, WHEEL_SLOTS>,
+    ) {
+        // Collect fired timers
+        let mut timed_out = Vec::new();
+        wheel.tick_now(|_handle, event| match event {
+            ControlTimerEvent::SessionTimeout(client_id) => {
+                timed_out.push(client_id);
+            }
+        });
+
+        // Process timeouts
+        for client_id in timed_out {
+            self.handle_timeout(client_id);
+        }
+    }
+
+    /// Handles a session timeout - disconnects the client.
+    fn handle_timeout(&mut self, client_id: ClientId) {
+        if let Some(session) = self.sessions.get_mut(&client_id) {
+            warn!(client = %client_id, "session timeout, disconnecting");
+            session.timeout_scheduled = false;
+
+            // Notify client of disconnect (use Shutdown as there's no Disconnected variant)
+            if session.conn.tx.push(DriverMessage::Shutdown).is_err() {
+                warn!(client = %client_id, "client queue full, dropping Shutdown");
+            }
+        }
+
+        // Clean up the session
+        self.cleanup_session(client_id);
     }
 }
